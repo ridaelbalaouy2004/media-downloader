@@ -100,10 +100,11 @@ export function HomePage({ settings }: HomePageProps) {
         setMediaInfo(result.data);
         setAnalysisState('success');
 
-        // Auto-select preferred 720p MP4 or best quality
+        // Auto-select Best Available Quality or preferred format
         const options = result.data.qualityOptions;
         if (options.length > 0) {
           const preferred =
+            options.find(o => o.id === 'best-video-mp4') ||
             options.find(o => o.height === 720 && o.formatTag === 'mp4') ||
             options.find(o => o.height >= 720 && o.formatTag === 'mp4') ||
             options.find(o => !o.isAudioOnly) ||
@@ -272,6 +273,12 @@ export function HomePage({ settings }: HomePageProps) {
 
                 {/* Meta */}
                 <div className="flex-1 min-w-0">
+                  {mediaInfo.platform && (
+                    <span className="inline-flex items-center gap-1 uppercase tracking-wider text-[10px] font-bold px-2 py-0.5 rounded-md bg-white/10 text-white/70 mb-1.5 border border-white/10">
+                      <span className="w-1.5 h-1.5 rounded-full bg-brand-400" />
+                      {mediaInfo.platform}
+                    </span>
+                  )}
                   <h2 className="text-base font-bold text-white/95 leading-tight line-clamp-2">
                     {mediaInfo.title}
                   </h2>

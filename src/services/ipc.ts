@@ -19,6 +19,7 @@ interface ElectronAPI {
   startDownload: (opts: StartDownloadOptions) => Promise<{ success: boolean; jobId?: string; error?: string }>;
   cancelDownload: (jobId: string) => Promise<{ success: boolean }>;
   getJobs: () => Promise<{ success: boolean; data?: DownloadJob[] }>;
+  dismissJob: (jobId: string) => Promise<{ success: boolean }>;
   getHistory: () => Promise<{ success: boolean; data?: DownloadHistoryEntry[] }>;
   removeHistoryEntry: (jobId: string) => Promise<{ success: boolean }>;
   clearHistory: () => Promise<{ success: boolean }>;
@@ -54,6 +55,7 @@ const noopAPI: ElectronAPI = {
   startDownload: async () => ({ success: false, error: 'Not running in Electron' }),
   cancelDownload: async () => ({ success: false }),
   getJobs: async () => ({ success: true, data: [] }),
+  dismissJob: async () => ({ success: true }),
   getHistory: async () => ({ success: true, data: [] }),
   removeHistoryEntry: async () => ({ success: true }),
   clearHistory: async () => ({ success: true }),
@@ -98,6 +100,7 @@ export const ipc = {
   startDownload: (opts: StartDownloadOptions) => getAPI().startDownload(opts),
   cancelDownload: (jobId: string) => getAPI().cancelDownload(jobId),
   getJobs: () => getAPI().getJobs(),
+  dismissJob: (jobId: string) => getAPI().dismissJob(jobId),
 
   // ─── History ──────────────────────────────────────────────────────────────
   getHistory: () => getAPI().getHistory(),

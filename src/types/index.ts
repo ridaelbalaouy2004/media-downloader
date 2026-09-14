@@ -15,6 +15,8 @@ export interface MediaFormat {
   label: string;
 }
 
+export type PlatformType = 'youtube' | 'instagram' | 'facebook' | 'tiktok' | 'image' | 'generic';
+
 export interface MediaInfo {
   url: string;
   title: string;
@@ -27,6 +29,7 @@ export interface MediaInfo {
   formats: MediaFormat[];
   qualityOptions: QualityOption[];
   webpageUrl: string;
+  platform?: PlatformType;
 }
 
 export interface QualityOption {
@@ -39,6 +42,7 @@ export interface QualityOption {
   needsMerge: boolean;
   estimatedSize: number | null;
   isAudioOnly: boolean;
+  mediaType?: 'video' | 'audio' | 'image';
 }
 
 export type DownloadStatus =

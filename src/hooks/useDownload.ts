@@ -47,8 +47,13 @@ export function useDownloads() {
     await ipc.cancelDownload(jobId);
   }, []);
 
-  const dismissJob = useCallback((jobId: string) => {
+  const dismissJob = useCallback(async (jobId: string) => {
     setJobs(prev => prev.filter(j => j.jobId !== jobId));
+    try {
+      await ipc.dismissJob(jobId);
+    } catch (err) {
+      console.error('Failed to dismiss job:', err);
+    }
   }, []);
 
   const activeJobs = jobs.filter(j =>

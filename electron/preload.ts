@@ -35,6 +35,9 @@ const api = {
       data?: DownloadJob[];
     }>,
 
+  dismissJob: (jobId: string) =>
+    ipcRenderer.invoke('media:dismiss-job', jobId) as Promise<{ success: boolean }>,
+
   // ─── History ──────────────────────────────────────────────────────────────
   getHistory: () =>
     ipcRenderer.invoke('history:get') as Promise<{

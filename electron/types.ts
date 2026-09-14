@@ -16,6 +16,8 @@ export interface MediaFormat {
   label: string; // human-readable
 }
 
+export type PlatformType = 'youtube' | 'instagram' | 'facebook' | 'tiktok' | 'image' | 'generic';
+
 export interface MediaInfo {
   url: string;
   title: string;
@@ -28,18 +30,20 @@ export interface MediaInfo {
   formats: MediaFormat[];
   qualityOptions: QualityOption[];
   webpageUrl: string;
+  platform?: PlatformType;
 }
 
 export interface QualityOption {
   id: string; // composite key e.g. "1080p-mp4"
   label: string; // "1080p Full HD — MP4"
   height: number;
-  formatTag: string; // "mp4" | "webm"
+  formatTag: string; // "mp4" | "webm" | "mp3" | "m4a" | "jpg" | "png" | "webp"
   videoFormatId: string | null;
   audioFormatId: string | null;
   needsMerge: boolean;
   estimatedSize: number | null;
   isAudioOnly: boolean;
+  mediaType?: 'video' | 'audio' | 'image';
 }
 
 export type DownloadStatus =

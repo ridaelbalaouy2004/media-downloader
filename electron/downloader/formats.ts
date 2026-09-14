@@ -1,11 +1,16 @@
 import type { MediaFormat, QualityOption } from '../types';
 
 /**
+ * Standard supported resolution heights (in descending order).
+ */
+export const STANDARD_HEIGHTS = [2160, 1440, 1080, 720, 480, 360, 240, 144];
+
+/**
  * Parse yt-dlp format objects into our normalized MediaFormat structure.
  */
 export function parseFormat(raw: Record<string, unknown>): MediaFormat | null {
   const formatId = String(raw.format_id || '');
-  const ext = String(raw.ext || '');
+  const ext = String(raw.ext || '').toLowerCase();
   const vcodec = String(raw.vcodec || 'none');
   const acodec = String(raw.acodec || 'none');
   const height = Number(raw.height) || 0;
@@ -16,21 +21,24 @@ export function parseFormat(raw: Record<string, unknown>): MediaFormat | null {
   const tbr = raw.tbr ? Number(raw.tbr) : null;
   const quality = Number(raw.quality) || 0;
 
-  const hasVideo = vcodec !== 'none' && vcodec !== '' && height > 0;
+  const isImage = ['jpg', 'jpeg', 'png', 'webp'].includes(ext) || vcodec === 'image';
+  const hasVideo = !isImage && vcodec !== 'none' && vcodec !== '' && height > 0;
   const hasAudio = acodec !== 'none' && acodec !== '';
 
   if (!formatId) return null;
 
   // Build human-readable resolution label
   let resolution = 'audio only';
-  if (hasVideo) {
+  if (isImage) {
+    resolution = width > 0 && height > 0 ? `${width}x${height}` : 'Image';
+  } else if (hasVideo) {
     if (height > 0) {
       resolution = `${height}p`;
       if (width > 0) resolution = `${width}x${height}`;
     }
   }
 
-  const label = buildFormatLabel(hasVideo, hasAudio, height, ext, fps);
+  const label = buildFormatLabel(hasVideo, hasAudio, isImage, height, ext, fps);
 
   return {
     formatId,
@@ -51,10 +59,12 @@ export function parseFormat(raw: Record<string, unknown>): MediaFormat | null {
 function buildFormatLabel(
   hasVideo: boolean,
   hasAudio: boolean,
+  isImage: boolean,
   height: number,
   ext: string,
   fps: number | null
 ): string {
+  if (isImage) return `Image — ${ext.toUpperCase()}`;
   if (!hasVideo && hasAudio) return `Audio only — ${ext.toUpperCase()}`;
 
   const res = height > 0 ? `${height}p` : 'Unknown';
@@ -66,39 +76,113 @@ function buildFormatLabel(
 
 /**
  * Build quality options from a list of parsed formats.
- * Groups formats into human-readable quality tiers.
+ * Groups formats into human-readable quality tiers:
+ * - Best Available Quality — MP4 (Auto)
+ * - Individual resolutions (2160p down to 144p)
+ * - Audio-only (MP3, M4A)
+ * - Images (when available)
  */
-export function buildQualityOptions(formats: MediaFormat[]): QualityOption[] {
+export function buildQualityOptions(formats: MediaFormat[], isDirectImage = false): QualityOption[] {
   const options: QualityOption[] = [];
+
+  // Handle direct image media
+  if (isDirectImage) {
+    options.push(
+      {
+        id: 'image-jpg',
+        label: 'Image — JPG (Best Quality)',
+        height: 0,
+        formatTag: 'jpg',
+        videoFormatId: null,
+        audioFormatId: null,
+        needsMerge: false,
+        estimatedSize: null,
+        isAudioOnly: false,
+        mediaType: 'image',
+      },
+      {
+        id: 'image-png',
+        label: 'Image — PNG (Lossless)',
+        height: 0,
+        formatTag: 'png',
+        videoFormatId: null,
+        audioFormatId: null,
+        needsMerge: false,
+        estimatedSize: null,
+        isAudioOnly: false,
+        mediaType: 'image',
+      },
+      {
+        id: 'image-webp',
+        label: 'Image — WebP',
+        height: 0,
+        formatTag: 'webp',
+        videoFormatId: null,
+        audioFormatId: null,
+        needsMerge: false,
+        estimatedSize: null,
+        isAudioOnly: false,
+        mediaType: 'image',
+      }
+    );
+    return options;
+  }
 
   // Separate video-only, audio-only, and combined formats
   const videoFormats = formats.filter(f => f.hasVideo);
   const audioFormats = formats.filter(f => !f.hasVideo && f.hasAudio);
   const combinedFormats = formats.filter(f => f.hasVideo && f.hasAudio);
+  const hasAnyAudio = audioFormats.length > 0 || combinedFormats.length > 0;
 
-  // Get unique heights
-  const heights = [...new Set(videoFormats.map(f => getHeight(f)))]
-    .filter(h => h > 0)
-    .sort((a, b) => b - a);
+  // Find all available heights normalized to standard tiers
+  const rawHeights = [...new Set(videoFormats.map(f => getEffectiveHeight(f)))].filter(h => h > 0);
+  const maxHeight = rawHeights.length > 0 ? Math.max(...rawHeights) : 0;
 
-  // For each height, create options for supported containers
-  for (const height of heights) {
-    // Check MP4 option
-    const mp4Option = buildVideoOption(height, 'mp4', videoFormats, audioFormats, combinedFormats);
-    if (mp4Option) options.push(mp4Option);
-
-    // Check WebM option
-    const webmOption = buildVideoOption(height, 'webm', videoFormats, audioFormats, combinedFormats);
-    if (webmOption) options.push(webmOption);
+  // 1. Best Available Quality (Top Option for 1-click highest quality)
+  if (videoFormats.length > 0 || combinedFormats.length > 0) {
+    options.push({
+      id: 'best-video-mp4',
+      label: `Best Available Quality — MP4 (${getResolutionLabel(maxHeight)})`,
+      height: maxHeight,
+      formatTag: 'mp4',
+      videoFormatId: null,
+      audioFormatId: null,
+      needsMerge: false,
+      estimatedSize: null,
+      isAudioOnly: false,
+      mediaType: 'video',
+    });
   }
 
-  // Audio-only options
-  if (audioFormats.length > 0) {
+  // 2. Map standard heights (2160p down to 144p)
+  for (const stdHeight of STANDARD_HEIGHTS) {
+    // Only include this standard height if the media actually provides video at or near this tier
+    const matchingRawHeight = rawHeights.find(h => isCloseHeight(h, stdHeight));
+    if (!matchingRawHeight) continue;
+
+    const mp4Option = buildVideoOption(matchingRawHeight, stdHeight, 'mp4', videoFormats, audioFormats, combinedFormats);
+    if (mp4Option && !options.some(o => o.id === mp4Option.id)) {
+      options.push(mp4Option);
+    }
+  }
+
+  // Fallback: If no standard heights matched but video exists, add the raw heights
+  if (options.length <= 1 && videoFormats.length > 0) {
+    for (const h of rawHeights.sort((a, b) => b - a)) {
+      const opt = buildVideoOption(h, h, 'mp4', videoFormats, audioFormats, combinedFormats);
+      if (opt && !options.some(o => o.id === opt.id)) {
+        options.push(opt);
+      }
+    }
+  }
+
+  // 3. Audio-only options (Always provide MP3 and M4A when audio is present)
+  if (hasAnyAudio) {
     const bestAudio = selectBestAudioFormat(audioFormats, null);
 
     options.push({
       id: 'audio-mp3',
-      label: 'Audio Only — MP3',
+      label: 'Audio Only — MP3 (High Quality)',
       height: 0,
       formatTag: 'mp3',
       videoFormatId: null,
@@ -106,11 +190,12 @@ export function buildQualityOptions(formats: MediaFormat[]): QualityOption[] {
       needsMerge: false,
       estimatedSize: bestAudio?.filesize || null,
       isAudioOnly: true,
+      mediaType: 'audio',
     });
 
     options.push({
       id: 'audio-m4a',
-      label: 'Audio Only — M4A',
+      label: 'Audio Only — M4A (AAC Audio)',
       height: 0,
       formatTag: 'm4a',
       videoFormatId: null,
@@ -118,65 +203,91 @@ export function buildQualityOptions(formats: MediaFormat[]): QualityOption[] {
       needsMerge: false,
       estimatedSize: bestAudio?.filesize || null,
       isAudioOnly: true,
+      mediaType: 'audio',
     });
   }
 
   return options;
 }
 
+function isCloseHeight(rawHeight: number, stdHeight: number): boolean {
+  // Exact match
+  if (rawHeight === stdHeight) return true;
+  // Account for slight aspect ratio variations (e.g. 1088 vs 1080, 718 vs 720, 484 vs 480)
+  return Math.abs(rawHeight - stdHeight) <= 12;
+}
+
 function buildVideoOption(
-  height: number,
+  rawHeight: number,
+  stdHeight: number,
   container: 'mp4' | 'webm',
   videoFormats: MediaFormat[],
   audioFormats: MediaFormat[],
   combinedFormats: MediaFormat[]
 ): QualityOption | null {
-  // 1. Try to find a combined format at this height for this container
+  // 1. Try to find a combined format at this height
   const combinedAtHeight = combinedFormats
-    .filter(f => getHeight(f) === height && isCompatibleContainer(f, container))
+    .filter(f => getEffectiveHeight(f) === rawHeight && isCompatibleContainer(f, container))
     .sort((a, b) => (b.filesize || 0) - (a.filesize || 0));
 
   if (combinedAtHeight.length > 0) {
     const fmt = combinedAtHeight[0];
     return {
-      id: `${height}p-${container}-combined`,
-      label: buildQualityLabel(height, container, false, fmt.fps),
-      height,
+      id: `${stdHeight}p-${container}`,
+      label: buildQualityLabel(stdHeight, container, false, fmt.fps),
+      height: stdHeight,
       formatTag: container,
       videoFormatId: fmt.formatId,
       audioFormatId: null,
       needsMerge: false,
       estimatedSize: fmt.filesize,
       isAudioOnly: false,
+      mediaType: 'video',
     };
   }
 
   // 2. Try video-only + best audio merge
   const videoAtHeight = videoFormats
-    .filter(f => getHeight(f) === height && isCompatibleContainer(f, container) && !f.hasAudio)
+    .filter(f => getEffectiveHeight(f) === rawHeight && isCompatibleContainer(f, container) && !f.hasAudio)
     .sort((a, b) => (b.filesize || b.tbr || 0) - (a.filesize || a.tbr || 0));
 
   if (videoAtHeight.length > 0) {
     const videoFmt = videoAtHeight[0];
     const audioFmt = selectBestAudioFormat(audioFormats, container);
-
-    if (!audioFmt) {
-      // No audio available, skip this option
-      return null;
-    }
-
-    const estimatedSize = (videoFmt.filesize || 0) + (audioFmt.filesize || 0);
+    const estimatedSize = (videoFmt.filesize || 0) + (audioFmt?.filesize || 0);
 
     return {
-      id: `${height}p-${container}-merged`,
-      label: buildQualityLabel(height, container, true, videoFmt.fps),
-      height,
+      id: `${stdHeight}p-${container}`,
+      label: buildQualityLabel(stdHeight, container, Boolean(audioFmt), videoFmt.fps),
+      height: stdHeight,
       formatTag: container,
       videoFormatId: videoFmt.formatId,
-      audioFormatId: audioFmt.formatId,
-      needsMerge: true,
+      audioFormatId: audioFmt?.formatId || null,
+      needsMerge: Boolean(audioFmt),
       estimatedSize: estimatedSize > 0 ? estimatedSize : null,
       isAudioOnly: false,
+      mediaType: 'video',
+    };
+  }
+
+  // 3. Fallback to any video format at this height
+  const anyVideoAtHeight = videoFormats
+    .filter(f => getEffectiveHeight(f) === rawHeight)
+    .sort((a, b) => (b.filesize || b.tbr || 0) - (a.filesize || a.tbr || 0));
+
+  if (anyVideoAtHeight.length > 0) {
+    const videoFmt = anyVideoAtHeight[0];
+    return {
+      id: `${stdHeight}p-${container}`,
+      label: buildQualityLabel(stdHeight, container, false, videoFmt.fps),
+      height: stdHeight,
+      formatTag: container,
+      videoFormatId: videoFmt.formatId,
+      audioFormatId: null,
+      needsMerge: false,
+      estimatedSize: videoFmt.filesize,
+      isAudioOnly: false,
+      mediaType: 'video',
     };
   }
 
@@ -192,12 +303,12 @@ function buildQualityLabel(
   const resLabel = getResolutionLabel(height);
   const fpsTag = fps && fps > 30 ? ` ${Math.round(fps)}fps` : '';
   const ext = container.toUpperCase();
-  const mergeNote = needsMerge ? ' ✦ merged' : ' ✦ combined';
+  const mergeNote = needsMerge ? ' ✦ merged' : '';
 
   return `${resLabel}${fpsTag} — ${ext}${mergeNote}`;
 }
 
-function getResolutionLabel(height: number): string {
+export function getResolutionLabel(height: number): string {
   if (height >= 2160) return '4K (2160p)';
   if (height >= 1440) return '2K (1440p)';
   if (height >= 1080) return '1080p Full HD';
@@ -206,28 +317,47 @@ function getResolutionLabel(height: number): string {
   if (height >= 360) return '360p';
   if (height >= 240) return '240p';
   if (height >= 144) return '144p';
-  return `${height}p`;
+  if (height > 0) return `${height}p`;
+  return 'Best Quality';
 }
 
-function getHeight(f: MediaFormat): number {
-  const match = f.resolution.match(/x(\d+)$/) || f.resolution.match(/^(\d+)p/);
-  if (match) return parseInt(match[1]);
+function getEffectiveHeight(f: MediaFormat): number {
+  // Support both horizontal (1920x1080) and vertical (1080x1920) formats
+  const dimMatch = f.resolution.match(/(\d+)x(\d+)/);
+  if (dimMatch) {
+    const w = parseInt(dimMatch[1], 10);
+    const h = parseInt(dimMatch[2], 10);
+    // For vertical videos (w < h), the standard quality tier corresponds to w (e.g., 1080x1920 is 1080p vertical)
+    if (w > 0 && h > 0 && w < h) {
+      return w;
+    }
+    return h;
+  }
+
+  const pMatch = f.resolution.match(/^(\d+)p/);
+  if (pMatch) return parseInt(pMatch[1], 10);
+
   return 0;
 }
 
 function isCompatibleContainer(f: MediaFormat, container: 'mp4' | 'webm'): boolean {
   if (container === 'mp4') {
-    return ['mp4', 'm4v', 'mov'].includes(f.ext) ||
+    return (
+      ['mp4', 'm4v', 'mov'].includes(f.ext) ||
       f.vcodec.includes('avc') ||
       f.vcodec.includes('h264') ||
       f.vcodec.includes('hevc') ||
-      f.vcodec.includes('h265');
+      f.vcodec.includes('h265') ||
+      f.vcodec.includes('mp4v')
+    );
   }
   if (container === 'webm') {
-    return f.ext === 'webm' ||
+    return (
+      f.ext === 'webm' ||
       f.vcodec.includes('vp8') ||
       f.vcodec.includes('vp9') ||
-      f.vcodec.includes('av01');
+      f.vcodec.includes('av01')
+    );
   }
   return false;
 }
@@ -259,29 +389,25 @@ function selectBestAudioFormat(
 }
 
 /**
- * Build the yt-dlp format string for a quality option.
- * Returns the format selector string to pass to yt-dlp -f
+ * Build the yt-dlp format selector string to pass to yt-dlp -f
  */
 export function buildYtDlpFormatSelector(option: QualityOption): string {
+  // Audio only
   if (option.isAudioOnly) {
-    // Audio only: get best audio
-    return 'bestaudio';
+    return 'bestaudio/best';
   }
 
-  if (!option.needsMerge && option.videoFormatId) {
-    // Combined format — download directly
-    return option.videoFormatId;
+  // Image
+  if (option.mediaType === 'image') {
+    return 'best';
   }
 
-  if (option.videoFormatId && option.audioFormatId) {
-    // Video + audio separate — yt-dlp will try to merge, but we handle merge in FFmpeg
-    return `${option.videoFormatId}+${option.audioFormatId}`;
+  // Best Available Quality (Auto)
+  if (option.id === 'best-video-mp4') {
+    return 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bestvideo+bestaudio/best';
   }
 
-  // Fallback: ask yt-dlp for best video+audio up to the target height
-  if (option.height > 0) {
-    return `bestvideo[height<=${option.height}]+bestaudio/best[height<=${option.height}]`;
-  }
-
-  return 'bestvideo+bestaudio/best';
+  // Specific height
+  const height = option.height > 0 ? option.height : 720;
+  return `bv*[height<=${height}][ext=mp4]+ba[ext=m4a]/b[height<=${height}][ext=mp4]/bv*[height<=${height}]+ba/b[height<=${height}]/best[height<=${height}]/best`;
 }

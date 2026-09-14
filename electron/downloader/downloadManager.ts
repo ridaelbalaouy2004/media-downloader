@@ -4,7 +4,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { BrowserWindow } from 'electron';
 import { downloadMedia } from './ytdlp';
 import { buildOutputFilename } from '../utils/sanitize';
-import { getJobTempDir, ensureDir } from '../utils/paths';
+import { getJobTempDir, ensureDir, getAppDataDir } from '../utils/paths';
 import { addHistoryEntry } from '../utils/history';
 import { processManager } from './processManager';
 import type {
@@ -21,12 +21,70 @@ interface JobWithMeta extends DownloadJob {
   _qualityOption: QualityOption;
 }
 
+function getJobsFilePath(): string {
+  const dataDir = getAppDataDir();
+  ensureDir(dataDir);
+  return path.join(dataDir, 'jobs.json');
+}
+
+function loadPersistedJobs(): Map<string, JobWithMeta> {
+  const map = new Map<string, JobWithMeta>();
+  try {
+    const filePath = getJobsFilePath();
+    if (fs.existsSync(filePath)) {
+      const raw = fs.readFileSync(filePath, 'utf-8');
+      const list = JSON.parse(raw);
+      if (Array.isArray(list)) {
+        for (const item of list) {
+          if (item && item.jobId) {
+            const status = ['downloading', 'queued', 'merging', 'analyzing', 'finalizing'].includes(item.status)
+              ? 'cancelled'
+              : item.status;
+            map.set(item.jobId, {
+              ...item,
+              status,
+              _qualityOption: item._qualityOption || {
+                id: 'default',
+                label: item.qualityLabel || 'Default',
+                height: 0,
+                formatTag: item.format || 'mp4',
+                videoFormatId: null,
+                audioFormatId: null,
+                needsMerge: false,
+                estimatedSize: null,
+                isAudioOnly: false,
+              },
+            });
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Failed to load persisted jobs:', err);
+  }
+  return map;
+}
+
+function savePersistedJobs(jobs: Map<string, JobWithMeta>): void {
+  try {
+    const filePath = getJobsFilePath();
+    const list = [...jobs.values()].slice(-50);
+    fs.writeFileSync(filePath, JSON.stringify(list, null, 2), 'utf-8');
+  } catch (err) {
+    console.error('Failed to save persisted jobs:', err);
+  }
+}
+
 class DownloadManager {
   private jobs = new Map<string, JobWithMeta>();
   private queue: string[] = [];
   private running = new Set<string>();
   private maxConcurrent = MAX_CONCURRENT;
   private mainWindow: BrowserWindow | null = null;
+
+  constructor() {
+    this.jobs = loadPersistedJobs();
+  }
 
   setWindow(win: BrowserWindow): void {
     this.mainWindow = win;
@@ -74,12 +132,32 @@ class DownloadManager {
 
     this.jobs.set(jobId, job);
     this.queue.push(jobId);
+    savePersistedJobs(this.jobs);
 
     this.emitJobUpdate(job);
     this.emitProgress(job.progress);
 
     this.processQueue();
     return jobId;
+  }
+
+  /**
+   * Permanently dismiss / remove a job from memory and persistent storage.
+   * Does NOT touch history or downloaded media files.
+   */
+  dismissJob(jobId: string): boolean {
+    const existed = this.jobs.has(jobId);
+    if (existed) {
+      this.jobs.delete(jobId);
+      const queueIdx = this.queue.indexOf(jobId);
+      if (queueIdx !== -1) {
+        this.queue.splice(queueIdx, 1);
+      }
+      this.running.delete(jobId);
+      savePersistedJobs(this.jobs);
+      this.cleanTempDir(jobId);
+    }
+    return existed;
   }
 
   /**
@@ -104,6 +182,7 @@ class DownloadManager {
       progress: { ...job.progress, status: 'cancelled', stage: 'Cancelled' },
     });
 
+    savePersistedJobs(this.jobs);
     this.cleanTempDir(jobId);
     this.processQueue();
   }
@@ -311,6 +390,9 @@ class DownloadManager {
     const { _qualityOption: _, ...rest } = updated;
     this.emitJobUpdate(rest as DownloadJob);
     if (updates.progress) this.emitProgress(updates.progress);
+    if (updates.status && ['completed', 'failed', 'cancelled'].includes(updates.status)) {
+      savePersistedJobs(this.jobs);
+    }
   }
 
   private updateProgress(jobId: string, progress: Partial<DownloadProgress>): void {

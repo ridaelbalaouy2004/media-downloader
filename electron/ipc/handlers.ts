@@ -90,6 +90,11 @@ export function registerIpcHandlers(): void {
     return { success: true, data: downloadManager.getJobs() };
   });
 
+  ipcMain.handle('media:dismiss-job', async (_event, jobId: string) => {
+    const removed = downloadManager.dismissJob(jobId);
+    return { success: removed };
+  });
+
   // ─── Download History ────────────────────────────────────────────────────────
 
   ipcMain.handle('history:get', async () => {
