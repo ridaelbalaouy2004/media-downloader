@@ -1,0 +1,14 @@
+node_modules/
+dist/
+dist-electron/
+release/
+*.log
+.DS_Store
+Thumbs.db
+resources/bin/
+*.local
+.env
+test-electron.exe
+*.exe
+*.part
+
