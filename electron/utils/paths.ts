@@ -1,5 +1,6 @@
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 import { app } from 'electron';
 
 /**
@@ -119,14 +120,22 @@ export function getFfmpegDir(): string {
  * Get the app's data directory for storing settings and history.
  */
 export function getAppDataDir(): string {
-  return path.join(app.getPath('userData'), 'MediaDownloader');
+  if (app && typeof app.getPath === 'function') {
+    return path.join(app.getPath('userData'), 'MediaDownloader');
+  }
+  const appData = process.env.APPDATA || process.env.HOME || process.cwd();
+  return path.join(appData, 'MediaDownloader');
 }
 
 /**
  * Get the temp directory for download jobs.
  */
 export function getTempDir(): string {
-  return path.join(app.getPath('temp'), 'media-downloader');
+  if (app && typeof app.getPath === 'function') {
+    return path.join(app.getPath('temp'), 'media-downloader');
+  }
+  const tmp = process.env.TEMP || os.tmpdir();
+  return path.join(tmp, 'media-downloader');
 }
 
 /**

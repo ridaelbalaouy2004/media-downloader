@@ -10,7 +10,7 @@ let mainWindow: BrowserWindow | null = null;
 let splashWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 
-const isDev = !app.isPackaged && process.env.NODE_ENV !== 'production';
+const isDev = !app.isPackaged && (process.argv.includes('--dev') || process.env.NODE_ENV === 'development' || !!process.env.VITE_DEV_SERVER_URL);
 
 // Register window control IPC handlers once (not per-window)
 ipcMain.on('window:minimize', () => mainWindow?.minimize());
@@ -25,11 +25,26 @@ ipcMain.on('window:close', () => mainWindow?.close());
 
 function resolveIconPath(): string | undefined {
   const appRoot = app.getAppPath();
-  const iconIco = path.join(appRoot, 'public/icon.ico');
-  const iconPng = path.join(appRoot, 'public/icon.png');
-  if (fs.existsSync(iconIco)) return iconIco;
-  if (fs.existsSync(iconPng)) return iconPng;
-  return undefined;
+  const candidates = [
+    path.join(appRoot, 'public', 'icon.ico'),
+    path.join(appRoot, 'public', 'icon.png'),
+    path.join(appRoot, 'dist', 'icon.ico'),
+    path.join(appRoot, 'dist', 'icon.png'),
+    path.join(__dirname, '..', '..', 'public', 'icon.ico'),
+    path.join(__dirname, '..', '..', 'dist', 'icon.ico'),
+  ];
+  return candidates.find(p => fs.existsSync(p));
+}
+
+function getIndexPath(): string {
+  const appRoot = app.getAppPath();
+  const candidatePaths = [
+    path.join(appRoot, 'dist', 'index.html'),
+    path.join(__dirname, '..', '..', 'dist', 'index.html'),
+    path.join(__dirname, '..', 'dist', 'index.html'),
+  ];
+  const found = candidatePaths.find(p => fs.existsSync(p));
+  return found || path.join(appRoot, 'dist', 'index.html');
 }
 
 function createSplashWindow(): BrowserWindow {
@@ -101,17 +116,32 @@ function createWindow(): void {
 
   downloadManager.setWindow(mainWindow);
 
-  if (isDev) {
+  const indexPath = getIndexPath();
+
+  if (app.isPackaged) {
+    // Packaged production mode: NEVER touch localhost:5173, load local built bundle
+    console.log('[main] Packaged mode: loading local frontend from', indexPath);
+    mainWindow.loadFile(indexPath);
+  } else if (isDev && process.env.VITE_DEV_SERVER_URL) {
+    mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL).catch(() => {
+      mainWindow?.loadFile(indexPath);
+    });
+    mainWindow.webContents.on('did-fail-load', () => {
+      mainWindow?.loadFile(indexPath);
+    });
+  } else if (isDev) {
     mainWindow.loadURL('http://localhost:5173').catch(() => {
-      // If dev server is not running, fall back to built bundle
-      const indexPath = path.join(app.getAppPath(), 'dist', 'index.html');
-      if (fs.existsSync(indexPath)) {
+      mainWindow?.loadFile(indexPath);
+    });
+    // Fallback if dev server connection fails or is stopped
+    mainWindow.webContents.on('did-fail-load', (_event, _errorCode, _errorDescription, validatedURL) => {
+      if (validatedURL.includes('localhost:5173')) {
+        console.log('[main] Dev server unavailable, falling back to embedded production build...');
         mainWindow?.loadFile(indexPath);
       }
     });
   } else {
-    // In production, load the built React/Vite bundle directly
-    const indexPath = path.join(app.getAppPath(), 'dist', 'index.html');
+    // Standalone production mode: load embedded files directly
     mainWindow.loadFile(indexPath);
   }
 
@@ -208,8 +238,8 @@ app.on('web-contents-created', (_event, contents) => {
   contents.on('will-navigate', (event, navigationUrl) => {
     try {
       const parsed = new URL(navigationUrl);
-      if (isDev && navigationUrl.startsWith('http://localhost:5173')) return;
-      if (!isDev && parsed.protocol === 'file:') return;
+      if (navigationUrl.startsWith('http://localhost:5173')) return;
+      if (parsed.protocol === 'file:') return;
       event.preventDefault();
       shell.openExternal(navigationUrl);
     } catch {

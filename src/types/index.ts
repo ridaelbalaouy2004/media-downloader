@@ -49,6 +49,7 @@ export type DownloadStatus =
   | 'queued'
   | 'analyzing'
   | 'downloading'
+  | 'paused'
   | 'merging'
   | 'finalizing'
   | 'completed'
@@ -82,6 +83,12 @@ export interface DownloadJob {
   endTime: number | null;
   error: string | null;
   errorDetails: string | null;
+  platform?: PlatformType;
+  downloadType?: 'video' | 'audio' | 'image' | 'playlist';
+  isPlaylist?: boolean;
+  playlistTitle?: string;
+  playlistIndex?: number;
+  playlistTotal?: number;
 }
 
 export interface DownloadHistoryEntry {
@@ -128,4 +135,36 @@ export interface StartDownloadOptions {
   outputDir: string;
   title: string;
   thumbnail: string;
+  platform?: PlatformType;
+  downloadType?: 'video' | 'audio' | 'image' | 'playlist';
+  isPlaylist?: boolean;
+  playlistTitle?: string;
+  playlistIndex?: number;
+  playlistTotal?: number;
+}
+
+export interface PlaylistEntry {
+  id: string;
+  url: string;
+  title: string;
+  duration?: number;
+  thumbnail?: string;
+}
+
+export interface PlaylistInfo {
+  id: string;
+  title: string;
+  uploader?: string;
+  entryCount: number;
+  entries: PlaylistEntry[];
+  url: string;
+}
+
+export interface QueueStats {
+  active: number;
+  waiting: number;
+  paused: number;
+  completed: number;
+  failed: number;
+  total: number;
 }

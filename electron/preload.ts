@@ -7,11 +7,14 @@ import type {
   DiagnosticsResult,
   AppSettings,
   DownloadHistoryEntry,
+  PlaylistInfo,
+  QualityOption,
+  QueueStats,
 } from './types';
 
 // Safe type-checked API exposed to renderer
 const api = {
-  // ─── Media ────────────────────────────────────────────────────────────────
+  // ─── Media & Queue ────────────────────────────────────────────────────────
   analyzeUrl: (url: string) =>
     ipcRenderer.invoke('media:analyze', url) as Promise<{
       success: boolean;
@@ -28,6 +31,53 @@ const api = {
 
   cancelDownload: (jobId: string) =>
     ipcRenderer.invoke('media:cancel-download', jobId) as Promise<{ success: boolean }>,
+
+  pauseDownload: (jobId: string) =>
+    ipcRenderer.invoke('media:pause-download', jobId) as Promise<{ success: boolean }>,
+
+  resumeDownload: (jobId: string) =>
+    ipcRenderer.invoke('media:resume-download', jobId) as Promise<{ success: boolean }>,
+
+  retryDownload: (jobId: string) =>
+    ipcRenderer.invoke('media:retry-download', jobId) as Promise<{ success: boolean }>,
+
+  pauseAll: () =>
+    ipcRenderer.invoke('media:pause-all') as Promise<{ success: boolean }>,
+
+  resumeAll: () =>
+    ipcRenderer.invoke('media:resume-all') as Promise<{ success: boolean }>,
+
+  cancelAll: () =>
+    ipcRenderer.invoke('media:cancel-all') as Promise<{ success: boolean }>,
+
+  clearCompleted: () =>
+    ipcRenderer.invoke('media:clear-completed') as Promise<{ success: boolean }>,
+
+  clearFailed: () =>
+    ipcRenderer.invoke('media:clear-failed') as Promise<{ success: boolean }>,
+
+  setConcurrency: (n: number) =>
+    ipcRenderer.invoke('media:set-concurrency', n) as Promise<{ success: boolean; data?: number }>,
+
+  getConcurrency: () =>
+    ipcRenderer.invoke('media:get-concurrency') as Promise<{ success: boolean; data?: number }>,
+
+  getQueueStats: () =>
+    ipcRenderer.invoke('media:get-queue-stats') as Promise<{ success: boolean; data?: QueueStats }>,
+
+  getPlaylistInfo: (url: string) =>
+    ipcRenderer.invoke('media:get-playlist-info', url) as Promise<{
+      success: boolean;
+      data?: PlaylistInfo;
+      error?: string;
+    }>,
+
+  startPlaylistDownload: (opts: { playlist: PlaylistInfo; qualityOption: QualityOption; outputDir: string }) =>
+    ipcRenderer.invoke('media:start-playlist-download', opts) as Promise<{
+      success: boolean;
+      jobIds?: string[];
+      error?: string;
+    }>,
 
   getJobs: () =>
     ipcRenderer.invoke('media:get-jobs') as Promise<{
@@ -73,6 +123,18 @@ const api = {
 
   showItemInFolder: (filePath: string) =>
     ipcRenderer.invoke('system:show-item-in-folder', filePath) as Promise<{
+      success: boolean;
+      error?: string;
+    }>,
+
+  deleteFile: (filePath: string) =>
+    ipcRenderer.invoke('system:delete-file', filePath) as Promise<{
+      success: boolean;
+      error?: string;
+    }>,
+
+  deleteFolder: (folderPath: string) =>
+    ipcRenderer.invoke('system:delete-folder', folderPath) as Promise<{
       success: boolean;
       error?: string;
     }>,

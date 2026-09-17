@@ -9,8 +9,14 @@
   "scripts": {
     "dev": "concurrently -k \"npm run dev:vite\" \"npm run dev:electron\"",
     "dev:vite": "vite",
-    "dev:electron": "wait-on http://localhost:5173 && tsc -p tsconfig.electron.json && electron .",
+    "dev:electron": "wait-on http://localhost:5173 && tsc -p tsconfig.electron.json && electron . --dev",
     "build": "tsc -p tsconfig.electron.json && vite build",
+    "start": "electron .",
+    "preview": "npm run build && electron .",
+    "package": "npm run build && electron-builder --win",
+    "package:dir": "npm run build && electron-builder --win --dir",
+    "package:installer": "npm run build && electron-builder --win nsis",
+    "package:portable": "npm run build && electron-builder --win portable",
     "dist": "npm run build && electron-builder --win",
     "dist:win": "npm run build && electron-builder --win",
     "dist:nsis": "npm run build && electron-builder --win nsis",
@@ -90,7 +96,8 @@
       "createStartMenuShortcut": true,
       "shortcutName": "Media Downloader",
       "uninstallDisplayName": "Media Downloader",
-      "runAfterFinish": true
+      "runAfterFinish": true,
+      "artifactName": "MediaDownloader-Setup-${version}.exe"
     },
     "portable": {
       "artifactName": "MediaDownloader-Portable.exe"

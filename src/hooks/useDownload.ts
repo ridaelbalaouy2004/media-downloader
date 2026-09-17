@@ -1,15 +1,27 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import type { DownloadJob, DownloadProgress } from '../types';
 import { ipc } from '../services/ipc';
 
 export function useDownloads() {
   const [jobs, setJobs] = useState<DownloadJob[]>([]);
+  const [concurrency, setConcurrencyState] = useState<number>(1);
 
-  useEffect(() => {
-    // Load existing jobs on mount
+  const loadJobs = useCallback(() => {
     ipc.getJobs().then(result => {
       if (result.success && result.data) {
         setJobs(result.data);
+      }
+    });
+  }, []);
+
+  useEffect(() => {
+    // Load existing jobs on mount
+    loadJobs();
+
+    // Load initial concurrency
+    ipc.getConcurrency().then(res => {
+      if (res.success && typeof res.data === 'number') {
+        setConcurrencyState(res.data);
       }
     });
 
@@ -41,9 +53,49 @@ export function useDownloads() {
       unsubJob();
       unsubProgress();
     };
+  }, [loadJobs]);
+
+  const pauseDownload = useCallback(async (jobId: string) => {
+    setJobs(prev =>
+      prev.map(j =>
+        j.jobId === jobId
+          ? { ...j, status: 'paused', progress: { ...j.progress, status: 'paused', stage: 'Paused', speed: null } }
+          : j
+      )
+    );
+    await ipc.pauseDownload(jobId);
+  }, []);
+
+  const resumeDownload = useCallback(async (jobId: string) => {
+    setJobs(prev =>
+      prev.map(j =>
+        j.jobId === jobId
+          ? { ...j, status: 'queued', progress: { ...j.progress, status: 'queued', stage: 'Queued' } }
+          : j
+      )
+    );
+    await ipc.resumeDownload(jobId);
+  }, []);
+
+  const retryDownload = useCallback(async (jobId: string) => {
+    setJobs(prev =>
+      prev.map(j =>
+        j.jobId === jobId
+          ? { ...j, status: 'queued', error: null, errorDetails: null, progress: { ...j.progress, status: 'queued', stage: 'Queued', percent: 0 } }
+          : j
+      )
+    );
+    await ipc.retryDownload(jobId);
   }, []);
 
   const cancelDownload = useCallback(async (jobId: string) => {
+    setJobs(prev =>
+      prev.map(j =>
+        j.jobId === jobId
+          ? { ...j, status: 'cancelled', progress: { ...j.progress, status: 'cancelled', stage: 'Cancelled', speed: null } }
+          : j
+      )
+    );
     await ipc.cancelDownload(jobId);
   }, []);
 
@@ -56,19 +108,86 @@ export function useDownloads() {
     }
   }, []);
 
+  const pauseAll = useCallback(async () => {
+    setJobs(prev =>
+      prev.map(j =>
+        ['downloading', 'queued', 'analyzing', 'merging'].includes(j.status)
+          ? { ...j, status: 'paused', progress: { ...j.progress, status: 'paused', stage: 'Paused', speed: null } }
+          : j
+      )
+    );
+    await ipc.pauseAll();
+  }, []);
+
+  const resumeAll = useCallback(async () => {
+    setJobs(prev =>
+      prev.map(j =>
+        j.status === 'paused'
+          ? { ...j, status: 'queued', progress: { ...j.progress, status: 'queued', stage: 'Queued' } }
+          : j
+      )
+    );
+    await ipc.resumeAll();
+  }, []);
+
+  const cancelAll = useCallback(async () => {
+    setJobs(prev =>
+      prev.map(j =>
+        ['downloading', 'queued', 'analyzing', 'merging', 'paused'].includes(j.status)
+          ? { ...j, status: 'cancelled', progress: { ...j.progress, status: 'cancelled', stage: 'Cancelled', speed: null } }
+          : j
+      )
+    );
+    await ipc.cancelAll();
+  }, []);
+
+  const clearCompleted = useCallback(async () => {
+    setJobs(prev => prev.filter(j => j.status !== 'completed'));
+    await ipc.clearCompleted();
+  }, []);
+
+  const clearFailed = useCallback(async () => {
+    setJobs(prev => prev.filter(j => j.status !== 'failed' && j.status !== 'cancelled'));
+    await ipc.clearFailed();
+  }, []);
+
+  const setConcurrency = useCallback(async (n: number) => {
+    const val = Math.max(1, Math.min(3, n));
+    setConcurrencyState(val);
+    await ipc.setConcurrency(val);
+  }, []);
+
   const activeJobs = jobs.filter(j =>
-    ['queued', 'analyzing', 'downloading', 'merging', 'finalizing'].includes(j.status)
+    ['downloading', 'analyzing', 'merging', 'finalizing'].includes(j.status)
   );
 
-  const completedJobs = jobs.filter(j =>
-    ['completed', 'cancelled', 'failed'].includes(j.status)
-  );
+  const queuedJobs = jobs.filter(j => j.status === 'queued');
+
+  const pausedJobs = jobs.filter(j => j.status === 'paused');
+
+  const completedJobs = jobs.filter(j => j.status === 'completed');
+
+  const failedJobs = jobs.filter(j => j.status === 'failed' || j.status === 'cancelled');
 
   return {
     jobs,
     activeJobs,
+    queuedJobs,
+    pausedJobs,
     completedJobs,
+    failedJobs,
+    concurrency,
+    setConcurrency,
+    pauseDownload,
+    resumeDownload,
+    retryDownload,
     cancelDownload,
     dismissJob,
+    pauseAll,
+    resumeAll,
+    cancelAll,
+    clearCompleted,
+    clearFailed,
+    refreshJobs: loadJobs,
   };
 }

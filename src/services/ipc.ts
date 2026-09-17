@@ -10,6 +10,8 @@ import type {
   AppSettings,
   DownloadHistoryEntry,
   QualityOption,
+  PlaylistInfo,
+  QueueStats,
 } from '../types';
 
 // The shape of the API exposed by preload.ts via contextBridge
@@ -18,6 +20,19 @@ interface ElectronAPI {
   analyzeUrl: (url: string) => Promise<{ success: boolean; data?: MediaInfo; error?: string }>;
   startDownload: (opts: StartDownloadOptions) => Promise<{ success: boolean; jobId?: string; error?: string }>;
   cancelDownload: (jobId: string) => Promise<{ success: boolean }>;
+  pauseDownload: (jobId: string) => Promise<{ success: boolean }>;
+  resumeDownload: (jobId: string) => Promise<{ success: boolean }>;
+  retryDownload: (jobId: string) => Promise<{ success: boolean }>;
+  pauseAll: () => Promise<{ success: boolean }>;
+  resumeAll: () => Promise<{ success: boolean }>;
+  cancelAll: () => Promise<{ success: boolean }>;
+  clearCompleted: () => Promise<{ success: boolean }>;
+  clearFailed: () => Promise<{ success: boolean }>;
+  setConcurrency: (n: number) => Promise<{ success: boolean; data?: number }>;
+  getConcurrency: () => Promise<{ success: boolean; data?: number }>;
+  getQueueStats: () => Promise<{ success: boolean; data?: QueueStats }>;
+  getPlaylistInfo: (url: string) => Promise<{ success: boolean; data?: PlaylistInfo; error?: string }>;
+  startPlaylistDownload: (opts: { playlist: PlaylistInfo; qualityOption: QualityOption; outputDir: string }) => Promise<{ success: boolean; jobIds?: string[]; error?: string }>;
   getJobs: () => Promise<{ success: boolean; data?: DownloadJob[] }>;
   dismissJob: (jobId: string) => Promise<{ success: boolean }>;
   getHistory: () => Promise<{ success: boolean; data?: DownloadHistoryEntry[] }>;
@@ -27,6 +42,8 @@ interface ElectronAPI {
   openFile: (filePath: string) => Promise<{ success: boolean; error?: string }>;
   openFolder: (filePath: string) => Promise<{ success: boolean; error?: string }>;
   showItemInFolder: (filePath: string) => Promise<{ success: boolean; error?: string }>;
+  deleteFile: (filePath: string) => Promise<{ success: boolean; error?: string }>;
+  deleteFolder: (folderPath: string) => Promise<{ success: boolean; error?: string }>;
   openExternal: (url: string) => Promise<{ success: boolean; error?: string }>;
   runDiagnostics: () => Promise<{ success: boolean; data?: DiagnosticsResult }>;
   getSettings: () => Promise<{ success: boolean; data?: AppSettings }>;
@@ -54,6 +71,19 @@ const noopAPI: ElectronAPI = {
   analyzeUrl: async () => ({ success: false, error: 'Not running in Electron' }),
   startDownload: async () => ({ success: false, error: 'Not running in Electron' }),
   cancelDownload: async () => ({ success: false }),
+  pauseDownload: async () => ({ success: true }),
+  resumeDownload: async () => ({ success: true }),
+  retryDownload: async () => ({ success: true }),
+  pauseAll: async () => ({ success: true }),
+  resumeAll: async () => ({ success: true }),
+  cancelAll: async () => ({ success: true }),
+  clearCompleted: async () => ({ success: true }),
+  clearFailed: async () => ({ success: true }),
+  setConcurrency: async (n: number) => ({ success: true, data: n }),
+  getConcurrency: async () => ({ success: true, data: 1 }),
+  getQueueStats: async () => ({ success: true, data: { active: 0, waiting: 0, paused: 0, completed: 0, failed: 0, total: 0 } }),
+  getPlaylistInfo: async () => ({ success: false, error: 'Not in Electron' }),
+  startPlaylistDownload: async () => ({ success: false, error: 'Not in Electron' }),
   getJobs: async () => ({ success: true, data: [] }),
   dismissJob: async () => ({ success: true }),
   getHistory: async () => ({ success: true, data: [] }),
@@ -63,6 +93,8 @@ const noopAPI: ElectronAPI = {
   openFile: async () => ({ success: false, error: 'Not in Electron' }),
   openFolder: async () => ({ success: false, error: 'Not in Electron' }),
   showItemInFolder: async () => ({ success: false, error: 'Not in Electron' }),
+  deleteFile: async () => ({ success: false, error: 'Not in Electron' }),
+  deleteFolder: async () => ({ success: false, error: 'Not in Electron' }),
   openExternal: async (url: string) => {
     try {
       window.open(url, '_blank', 'noopener,noreferrer');
@@ -72,7 +104,7 @@ const noopAPI: ElectronAPI = {
     }
   },
   runDiagnostics: async () => ({ success: true, data: { ytDlpFound: false, ytDlpVersion: null, ytDlpPath: 'N/A (browser)', ffmpegFound: false, ffmpegVersion: null, ffmpegPath: 'N/A (browser)', ffprobeFound: false, ffprobePath: 'N/A (browser)', storageWritable: false, tempDirWritable: false } }),
-  getSettings: async () => ({ success: true, data: { defaultDownloadDir: '', defaultQuality: '1080p', defaultFormat: 'mp4', maxConcurrentDownloads: 2, theme: 'dark', autoCheckYtDlpUpdates: false, autoCheckFfmpegUpdates: false } }),
+  getSettings: async () => ({ success: true, data: { defaultDownloadDir: '', defaultQuality: '1080p', defaultFormat: 'mp4', maxConcurrentDownloads: 1, theme: 'dark', autoCheckYtDlpUpdates: false, autoCheckFfmpegUpdates: false } }),
   setSetting: async () => ({ success: true }),
   resetSettings: async () => ({ success: true }),
   getAppVersion: async () => ({ success: true, data: '1.0.0' }),
@@ -95,10 +127,24 @@ function getAPI(): ElectronAPI {
 }
 
 export const ipc = {
-  // ─── Media ────────────────────────────────────────────────────────────────
+  // ─── Media & Queue ────────────────────────────────────────────────────────
   analyzeUrl: (url: string) => getAPI().analyzeUrl(url),
   startDownload: (opts: StartDownloadOptions) => getAPI().startDownload(opts),
   cancelDownload: (jobId: string) => getAPI().cancelDownload(jobId),
+  pauseDownload: (jobId: string) => getAPI().pauseDownload(jobId),
+  resumeDownload: (jobId: string) => getAPI().resumeDownload(jobId),
+  retryDownload: (jobId: string) => getAPI().retryDownload(jobId),
+  pauseAll: () => getAPI().pauseAll(),
+  resumeAll: () => getAPI().resumeAll(),
+  cancelAll: () => getAPI().cancelAll(),
+  clearCompleted: () => getAPI().clearCompleted(),
+  clearFailed: () => getAPI().clearFailed(),
+  setConcurrency: (n: number) => getAPI().setConcurrency(n),
+  getConcurrency: () => getAPI().getConcurrency(),
+  getQueueStats: () => getAPI().getQueueStats(),
+  getPlaylistInfo: (url: string) => getAPI().getPlaylistInfo(url),
+  startPlaylistDownload: (opts: { playlist: PlaylistInfo; qualityOption: QualityOption; outputDir: string }) =>
+    getAPI().startPlaylistDownload(opts),
   getJobs: () => getAPI().getJobs(),
   dismissJob: (jobId: string) => getAPI().dismissJob(jobId),
 
@@ -112,6 +158,8 @@ export const ipc = {
   openFile: (filePath: string) => getAPI().openFile(filePath),
   openFolder: (filePath: string) => getAPI().openFolder(filePath),
   showItemInFolder: (filePath: string) => getAPI().showItemInFolder(filePath),
+  deleteFile: (filePath: string) => getAPI().deleteFile(filePath),
+  deleteFolder: (folderPath: string) => getAPI().deleteFolder(folderPath),
   openExternal: (url: string) => getAPI().openExternal(url),
 
   // ─── Diagnostics ─────────────────────────────────────────────────────────

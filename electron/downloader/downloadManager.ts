@@ -3,7 +3,14 @@ import fs from 'fs';
 import { v4 as uuidv4 } from 'uuid';
 import { BrowserWindow } from 'electron';
 import { downloadMedia } from './ytdlp';
-import { buildOutputFilename } from '../utils/sanitize';
+import {
+  sanitizeFilename,
+  sanitizeFolderName,
+  sanitizeWindowsName,
+  sanitizePath,
+  buildOutputFilename,
+  safeJoinPath,
+} from '../utils/sanitize';
 import { getJobTempDir, ensureDir, getAppDataDir } from '../utils/paths';
 import { addHistoryEntry } from '../utils/history';
 import { processManager } from './processManager';
@@ -13,9 +20,12 @@ import type {
   StartDownloadOptions,
   DownloadHistoryEntry,
   QualityOption,
+  PlaylistInfo,
+  QueueStats,
 } from '../types';
 
-const MAX_CONCURRENT = 2;
+// Default maximum simultaneous downloads is 1 (configurable: 1, 2, or 3)
+const DEFAULT_MAX_CONCURRENT = 1;
 
 interface JobWithMeta extends DownloadJob {
   _qualityOption: QualityOption;
@@ -37,12 +47,18 @@ function loadPersistedJobs(): Map<string, JobWithMeta> {
       if (Array.isArray(list)) {
         for (const item of list) {
           if (item && item.jobId) {
+            // Active states that were interrupted on shutdown become 'paused' so user can resume
             const status = ['downloading', 'queued', 'merging', 'analyzing', 'finalizing'].includes(item.status)
-              ? 'cancelled'
+              ? 'paused'
               : item.status;
             map.set(item.jobId, {
               ...item,
               status,
+              progress: {
+                ...item.progress,
+                status,
+                stage: status === 'paused' ? 'Paused' : item.progress?.stage || '',
+              },
               _qualityOption: item._qualityOption || {
                 id: 'default',
                 label: item.qualityLabel || 'Default',
@@ -68,18 +84,18 @@ function loadPersistedJobs(): Map<string, JobWithMeta> {
 function savePersistedJobs(jobs: Map<string, JobWithMeta>): void {
   try {
     const filePath = getJobsFilePath();
-    const list = [...jobs.values()].slice(-50);
+    const list = [...jobs.values()].slice(-100);
     fs.writeFileSync(filePath, JSON.stringify(list, null, 2), 'utf-8');
   } catch (err) {
     console.error('Failed to save persisted jobs:', err);
   }
 }
 
-class DownloadManager {
+export class DownloadManager {
   private jobs = new Map<string, JobWithMeta>();
   private queue: string[] = [];
   private running = new Set<string>();
-  private maxConcurrent = MAX_CONCURRENT;
+  private maxConcurrent = DEFAULT_MAX_CONCURRENT;
   private mainWindow: BrowserWindow | null = null;
 
   constructor() {
@@ -91,16 +107,21 @@ class DownloadManager {
   }
 
   setMaxConcurrent(n: number): void {
-    this.maxConcurrent = Math.max(1, Math.min(10, n));
+    this.maxConcurrent = Math.max(1, Math.min(3, n));
     this.processQueue();
+  }
+
+  getMaxConcurrent(): number {
+    return this.maxConcurrent;
   }
 
   /**
    * Create and queue a new download job.
-   * The qualityOption is carried internally so the renderer never re-sends it.
    */
   startDownload(opts: StartDownloadOptions): string {
     const jobId = uuidv4();
+    const sanitizedOutputDir = path.resolve(sanitizePath(opts.outputDir || getAppDataDir()));
+    const safePlaylistTitle = opts.playlistTitle ? sanitizeWindowsName(opts.playlistTitle) : undefined;
 
     const job: JobWithMeta = {
       jobId,
@@ -109,7 +130,7 @@ class DownloadManager {
       thumbnail: opts.thumbnail,
       qualityLabel: opts.qualityOption.label,
       format: opts.qualityOption.formatTag,
-      outputDir: opts.outputDir,
+      outputDir: sanitizedOutputDir,
       outputFile: null,
       status: 'queued',
       progress: {
@@ -127,6 +148,12 @@ class DownloadManager {
       endTime: null,
       error: null,
       errorDetails: null,
+      platform: opts.platform,
+      downloadType: opts.downloadType || (opts.qualityOption.isAudioOnly ? 'audio' : opts.qualityOption.mediaType === 'image' ? 'image' : 'video'),
+      isPlaylist: opts.isPlaylist,
+      playlistTitle: safePlaylistTitle,
+      playlistIndex: opts.playlistIndex,
+      playlistTotal: opts.playlistTotal,
       _qualityOption: opts.qualityOption,
     };
 
@@ -142,22 +169,141 @@ class DownloadManager {
   }
 
   /**
-   * Permanently dismiss / remove a job from memory and persistent storage.
-   * Does NOT touch history or downloaded media files.
+   * Queue all entries of a playlist.
    */
-  dismissJob(jobId: string): boolean {
-    const existed = this.jobs.has(jobId);
-    if (existed) {
-      this.jobs.delete(jobId);
-      const queueIdx = this.queue.indexOf(jobId);
-      if (queueIdx !== -1) {
-        this.queue.splice(queueIdx, 1);
-      }
-      this.running.delete(jobId);
-      savePersistedJobs(this.jobs);
-      this.cleanTempDir(jobId);
+  startPlaylistDownload(
+    playlist: PlaylistInfo,
+    qualityOption: QualityOption,
+    outputDir: string
+  ): string[] {
+    const jobIds: string[] = [];
+    const safePlaylistFolder = sanitizeWindowsName(playlist.title);
+    const baseDir = sanitizePath(outputDir || getAppDataDir());
+    const playlistDir = path.resolve(safeJoinPath(baseDir, safePlaylistFolder));
+    ensureDir(playlistDir);
+
+    playlist.entries.forEach((entry, idx) => {
+      // Check for duplicate in active queue
+      const isAlreadyQueued = [...this.jobs.values()].some(
+        j => j.url === entry.url && (j.status === 'queued' || j.status === 'downloading')
+      );
+      if (isAlreadyQueued) return;
+
+      const jobId = this.startDownload({
+        url: entry.url,
+        title: entry.title,
+        thumbnail: entry.thumbnail || '',
+        outputDir: playlistDir,
+        qualityOption,
+        platform: 'youtube',
+        downloadType: 'playlist',
+        isPlaylist: true,
+        playlistTitle: safePlaylistFolder,
+        playlistIndex: idx + 1,
+        playlistTotal: playlist.entryCount,
+      });
+      jobIds.push(jobId);
+    });
+
+    return jobIds;
+  }
+
+  /**
+   * Pause a running or queued download. Keeps temp files intact for resume.
+   */
+  pauseJob(jobId: string): boolean {
+    const job = this.jobs.get(jobId);
+    if (!job) return false;
+
+    if (!['downloading', 'queued', 'analyzing', 'merging'].includes(job.status)) {
+      return false;
     }
-    return existed;
+
+    if (this.running.has(jobId)) {
+      processManager.killJob(jobId);
+      this.running.delete(jobId);
+    }
+
+    const qIdx = this.queue.indexOf(jobId);
+    if (qIdx !== -1) {
+      this.queue.splice(qIdx, 1);
+    }
+
+    this.updateJob(jobId, {
+      status: 'paused',
+      progress: {
+        ...job.progress,
+        status: 'paused',
+        stage: 'Paused',
+        speed: null,
+      },
+    });
+
+    savePersistedJobs(this.jobs);
+    this.processQueue();
+    return true;
+  }
+
+  /**
+   * Resume a paused download.
+   */
+  resumeJob(jobId: string): boolean {
+    const job = this.jobs.get(jobId);
+    if (!job || job.status !== 'paused') return false;
+
+    this.updateJob(jobId, {
+      status: 'queued',
+      progress: {
+        ...job.progress,
+        status: 'queued',
+        stage: 'Queued',
+      },
+    });
+
+    if (!this.queue.includes(jobId) && !this.running.has(jobId)) {
+      this.queue.push(jobId);
+    }
+
+    savePersistedJobs(this.jobs);
+    this.processQueue();
+    return true;
+  }
+
+  /**
+   * Retry a failed or cancelled download.
+   */
+  retryJob(jobId: string): boolean {
+    const job = this.jobs.get(jobId);
+    if (!job) return false;
+
+    if (job.status !== 'failed' && job.status !== 'cancelled') {
+      return false;
+    }
+
+    this.updateJob(jobId, {
+      status: 'queued',
+      error: null,
+      errorDetails: null,
+      progress: {
+        jobId,
+        status: 'queued',
+        stage: 'Queued',
+        percent: 0,
+        downloadedBytes: 0,
+        totalBytes: job.progress.totalBytes,
+        speed: null,
+        eta: null,
+        filename: null,
+      },
+    });
+
+    if (!this.queue.includes(jobId) && !this.running.has(jobId)) {
+      this.queue.push(jobId);
+    }
+
+    savePersistedJobs(this.jobs);
+    this.processQueue();
+    return true;
   }
 
   /**
@@ -179,7 +325,7 @@ class DownloadManager {
     this.updateJob(jobId, {
       status: 'cancelled',
       endTime: Date.now(),
-      progress: { ...job.progress, status: 'cancelled', stage: 'Cancelled' },
+      progress: { ...job.progress, status: 'cancelled', stage: 'Cancelled', speed: null },
     });
 
     savePersistedJobs(this.jobs);
@@ -187,9 +333,115 @@ class DownloadManager {
     this.processQueue();
   }
 
+  /**
+   * Permanently dismiss / remove a job from memory and persistent storage.
+   * Does NOT touch history or delete the downloaded media file.
+   */
+  dismissJob(jobId: string): boolean {
+    const existed = this.jobs.has(jobId);
+    if (existed) {
+      if (this.running.has(jobId)) {
+        processManager.killJob(jobId);
+        this.running.delete(jobId);
+      }
+      this.jobs.delete(jobId);
+      const queueIdx = this.queue.indexOf(jobId);
+      if (queueIdx !== -1) {
+        this.queue.splice(queueIdx, 1);
+      }
+      savePersistedJobs(this.jobs);
+      this.cleanTempDir(jobId);
+      this.processQueue();
+    }
+    return existed;
+  }
+
+  // --- Bulk Operations ---
+
+  pauseAll(): void {
+    for (const [id, job] of [...this.jobs.entries()]) {
+      if (['downloading', 'queued', 'analyzing', 'merging'].includes(job.status)) {
+        this.pauseJob(id);
+      }
+    }
+  }
+
+  resumeAll(): void {
+    for (const [id, job] of [...this.jobs.entries()]) {
+      if (job.status === 'paused') {
+        this.resumeJob(id);
+      }
+    }
+  }
+
+  cancelAll(): void {
+    for (const [id, job] of [...this.jobs.entries()]) {
+      if (['downloading', 'queued', 'analyzing', 'merging', 'paused'].includes(job.status)) {
+        this.cancelDownload(id);
+      }
+    }
+  }
+
+  clearCompleted(): void {
+    for (const [id, job] of [...this.jobs.entries()]) {
+      if (job.status === 'completed') {
+        this.dismissJob(id);
+      }
+    }
+  }
+
+  clearFailed(): void {
+    for (const [id, job] of [...this.jobs.entries()]) {
+      if (job.status === 'failed' || job.status === 'cancelled') {
+        this.dismissJob(id);
+      }
+    }
+  }
+
+  clearAll(): void {
+    this.cancelAll();
+    this.jobs.clear();
+    this.queue = [];
+    this.running.clear();
+    savePersistedJobs(this.jobs);
+  }
+
+  getQueueStats(): QueueStats {
+    let active = 0;
+    let waiting = 0;
+    let paused = 0;
+    let completed = 0;
+    let failed = 0;
+
+    for (const job of this.jobs.values()) {
+      if (['downloading', 'analyzing', 'merging', 'finalizing'].includes(job.status)) {
+        active++;
+      } else if (job.status === 'queued') {
+        waiting++;
+      } else if (job.status === 'paused') {
+        paused++;
+      } else if (job.status === 'completed') {
+        completed++;
+      } else if (job.status === 'failed' || job.status === 'cancelled') {
+        failed++;
+      }
+    }
+
+    return {
+      active,
+      waiting,
+      paused,
+      completed,
+      failed,
+      total: this.jobs.size,
+    };
+  }
+
   getJobs(): DownloadJob[] {
-    // Strip internal _qualityOption before sending to renderer
-    return [...this.jobs.values()].map(({ _qualityOption: _, ...rest }) => rest as DownloadJob);
+    // Return newest first
+    return [...this.jobs.values()]
+      .reverse()
+      .map(({ _qualityOption: _, ...rest }) => rest as DownloadJob);
   }
 
   getJob(jobId: string): DownloadJob | null {
@@ -203,12 +455,16 @@ class DownloadManager {
     while (this.running.size < this.maxConcurrent && this.queue.length > 0) {
       const nextId = this.queue.shift();
       if (nextId) {
-        this.running.add(nextId);
-        this.executeDownload(nextId).catch(err => {
-          console.error('Download execution error:', err);
-          this.running.delete(nextId);
-          this.processQueue();
-        });
+        const job = this.jobs.get(nextId);
+        // Only run if still queued
+        if (job && job.status === 'queued') {
+          this.running.add(nextId);
+          this.executeDownload(nextId).catch(err => {
+            console.error('Download execution error:', err);
+            this.running.delete(nextId);
+            this.processQueue();
+          });
+        }
       }
     }
   }
@@ -230,6 +486,9 @@ class DownloadManager {
         qualityOption: job._qualityOption,
         outputDir: job.outputDir,
         tempDir,
+        isPlaylist: job.isPlaylist,
+        playlistTitle: job.playlistTitle,
+        playlistIndex: job.playlistIndex,
         onProgress: (progress) => {
           this.updateProgress(jobId, progress);
         },
@@ -239,7 +498,7 @@ class DownloadManager {
         },
         onError: (error, details) => {
           const currentJob = this.jobs.get(jobId);
-          if (currentJob?.status === 'cancelled') return;
+          if (currentJob?.status === 'cancelled' || currentJob?.status === 'paused') return;
           this.updateJob(jobId, {
             status: 'failed',
             endTime: Date.now(),
@@ -249,15 +508,20 @@ class DownloadManager {
               ...(currentJob?.progress ?? job.progress),
               status: 'failed',
               stage: 'Download failed',
+              speed: null,
             },
           });
         },
       });
 
-      // Check cancellation
+      // Check cancellation or pause
       const currentJob = this.jobs.get(jobId);
       if (!currentJob || currentJob.status === 'cancelled') {
         this.cleanTempDir(jobId);
+        return;
+      }
+      if (currentJob.status === 'paused') {
+        // Do not clean tempDir so partial files are kept for resume!
         return;
       }
 
@@ -273,26 +537,41 @@ class DownloadManager {
         percent: 100,
       });
 
-      const finalFile = await this.moveToOutput(jobId, tempOutputFile, job);
-      if (!finalFile) {
+      const moveResult = await this.moveToOutput(jobId, tempOutputFile, job);
+      if (!moveResult) {
         this.cleanTempDir(jobId);
         return;
       }
 
-      // Mark completed (Requirement 12: Download completed)
+      const { destPath: finalFile, targetDir: actualOutputDir } = moveResult;
+      const fileExists = fs.existsSync(finalFile);
+      const fileSize = fileExists ? fs.statSync(finalFile).size : 0;
+
+      // Debug log requirement
+      console.log(`[DOWNLOAD COMPLETED]
+URL: ${job.url}
+TITLE: ${job.title}
+EXPECTED PATH: ${finalFile}
+ACTUAL PATH: ${finalFile}
+FILE EXISTS: ${fileExists}
+FILE SIZE: ${fileSize}`);
+
+      // Mark completed with verified exact paths
       this.updateJob(jobId, {
         status: 'completed',
         endTime: Date.now(),
         outputFile: finalFile,
+        outputDir: actualOutputDir,
         progress: {
           ...currentJob.progress,
           status: 'completed',
           stage: 'Download completed',
           percent: 100,
+          speed: null,
         },
       });
 
-      // Persist to history
+      // Persist to history with verified exact real paths
       const finalJob = this.jobs.get(jobId)!;
       const historyEntry: DownloadHistoryEntry = {
         jobId: finalJob.jobId,
@@ -302,7 +581,7 @@ class DownloadManager {
         qualityLabel: finalJob.qualityLabel,
         format: finalJob.format,
         outputFile: finalFile,
-        outputDir: finalJob.outputDir,
+        outputDir: actualOutputDir,
         status: 'completed',
         startTime: finalJob.startTime,
         endTime: Date.now(),
@@ -317,7 +596,7 @@ class DownloadManager {
 
     } catch (err) {
       const currentJob = this.jobs.get(jobId);
-      if (currentJob?.status !== 'cancelled') {
+      if (currentJob?.status !== 'cancelled' && currentJob?.status !== 'paused') {
         this.updateJob(jobId, {
           status: 'failed',
           endTime: Date.now(),
@@ -327,10 +606,11 @@ class DownloadManager {
             ...(currentJob?.progress ?? job.progress),
             status: 'failed',
             stage: 'Download failed',
+            speed: null,
           },
         });
+        this.cleanTempDir(jobId);
       }
-      this.cleanTempDir(jobId);
     } finally {
       this.running.delete(jobId);
       this.processQueue();
@@ -341,23 +621,68 @@ class DownloadManager {
     jobId: string,
     tempFile: string,
     job: DownloadJob
-  ): Promise<string | null> {
+  ): Promise<{ destPath: string; targetDir: string } | null> {
     try {
-      const ext = path.extname(tempFile);
-      const safeName = buildOutputFilename(job.title, ext.replace('.', ''));
-      let destPath = path.join(job.outputDir, safeName);
-
-      let counter = 1;
-      while (fs.existsSync(destPath)) {
-        const baseName = path.basename(safeName, ext);
-        destPath = path.join(job.outputDir, `${baseName} (${counter})${ext}`);
-        counter++;
+      if (!fs.existsSync(tempFile)) {
+        throw new Error(`Downloaded temporary file not found at: ${tempFile}`);
       }
 
-      ensureDir(job.outputDir);
-      fs.copyFileSync(tempFile, destPath);
-      fs.unlinkSync(tempFile);
-      return destPath;
+      // Determine the real target directory using absolute paths with strict Windows sanitization
+      let targetDir = path.resolve(sanitizePath(job.outputDir));
+      if (job.isPlaylist && job.playlistTitle) {
+        const safePlaylistFolder = sanitizeWindowsName(job.playlistTitle);
+        if (path.basename(targetDir) !== safePlaylistFolder) {
+          targetDir = path.resolve(safeJoinPath(job.outputDir, safePlaylistFolder));
+        }
+      }
+      ensureDir(targetDir);
+
+      // Clean the filename using sanitizeWindowsName to strictly remove any trailing dots or spaces before extension
+      const rawFileName = path.basename(tempFile);
+      const ext = path.extname(rawFileName);
+      const baseName = path.basename(rawFileName, ext);
+      const cleanBase = sanitizeWindowsName(baseName);
+      const cleanExt = ext ? ext.replace(/^\./, '').replace(/[.\s]+$/, '').replace(/[\\/:*?"<>|]/g, '_').trim() : '';
+      const realFileName = cleanExt ? `${cleanBase}.${cleanExt}` : cleanBase;
+
+      let destPath = path.resolve(safeJoinPath(targetDir, realFileName));
+
+      if (path.resolve(tempFile) !== destPath) {
+        // If destPath already exists and is a different file, deduplicate safely
+        if (fs.existsSync(destPath)) {
+          let counter = 1;
+          while (fs.existsSync(destPath)) {
+            const deduplicated = cleanExt ? `${cleanBase} (${counter}).${cleanExt}` : `${cleanBase} (${counter})`;
+            destPath = path.resolve(safeJoinPath(targetDir, deduplicated));
+            counter++;
+          }
+        }
+
+        // Copy file to final location
+        fs.copyFileSync(tempFile, destPath);
+
+        // Clean temp file
+        try {
+          console.log(`[DELETE FILE]
+PATH: ${tempFile}
+FILE EXISTS: ${fs.existsSync(tempFile)}`);
+          fs.unlinkSync(tempFile);
+        } catch {
+          // ignore unlink error
+        }
+      }
+
+      // STRICT VALIDATION: Verify that the destination file exists!
+      if (!fs.existsSync(destPath)) {
+        throw new Error(`Destination file does not exist on disk: ${destPath}`);
+      }
+
+      const stat = fs.statSync(destPath);
+      if (stat.size === 0) {
+        throw new Error(`Destination file is 0 bytes: ${destPath}`);
+      }
+
+      return { destPath, targetDir };
     } catch (err) {
       this.updateJob(jobId, {
         status: 'failed',
@@ -374,6 +699,9 @@ class DownloadManager {
     setTimeout(() => {
       try {
         if (fs.existsSync(tempDir)) {
+          console.log(`[DELETE FOLDER]
+PATH: ${tempDir}
+FOLDER EXISTS: ${fs.existsSync(tempDir)}`);
           fs.rmSync(tempDir, { recursive: true, force: true });
         }
       } catch (err) {
@@ -390,7 +718,7 @@ class DownloadManager {
     const { _qualityOption: _, ...rest } = updated;
     this.emitJobUpdate(rest as DownloadJob);
     if (updates.progress) this.emitProgress(updates.progress);
-    if (updates.status && ['completed', 'failed', 'cancelled'].includes(updates.status)) {
+    if (updates.status && ['completed', 'failed', 'cancelled', 'paused'].includes(updates.status)) {
       savePersistedJobs(this.jobs);
     }
   }
@@ -421,12 +749,7 @@ class DownloadManager {
     try { return fs.statSync(filePath).size; } catch { return null; }
   }
 
-  /**
-   * storeQualityOption is no longer needed — kept for API compat.
-   */
-  storeQualityOption(_jobId: string, _option: unknown): void {
-    // no-op: quality option is now stored at startDownload time
-  }
+  storeQualityOption(_jobId: string, _option: unknown): void {}
 
   cleanAbandonedTempDirs(tempBase: string): void {
     try {

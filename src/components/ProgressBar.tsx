@@ -15,17 +15,19 @@ const statusColors: Record<DownloadStatus, string> = {
   completed: 'from-green-600 to-emerald-400',
   cancelled: 'from-white/20 to-white/30',
   failed: 'from-red-600 to-red-400',
+  paused: 'from-amber-500 to-yellow-400',
 };
 
 const statusLabels: Record<DownloadStatus, string> = {
-  queued: 'Preparing download',
+  queued: 'Waiting in queue',
   analyzing: 'Analyzing',
   downloading: 'Downloading',
   merging: 'Merging video and audio',
-  finalizing: 'Merging video and audio',
+  finalizing: 'Finalizing',
   completed: 'Download completed',
   cancelled: 'Cancelled',
   failed: 'Download failed',
+  paused: 'Paused',
 };
 
 export function ProgressBar({ progress, onCancel }: ProgressBarProps) {
@@ -45,6 +47,7 @@ export function ProgressBar({ progress, onCancel }: ProgressBarProps) {
             ${status === 'completed' ? 'bg-green-400' : ''}
             ${status === 'failed' ? 'bg-red-400' : ''}
             ${status === 'cancelled' ? 'bg-white/30' : ''}
+            ${status === 'paused' ? 'bg-amber-400' : ''}
             ${isActive ? 'bg-brand-400 animate-pulse' : ''}
           `} />
 

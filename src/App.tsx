@@ -8,12 +8,16 @@ import { useSettings } from './hooks/useSettings';
 import { ipc } from './services/ipc';
 import { useDownloads } from './hooks/useDownload';
 
-type Page = 'home' | 'downloads' | 'settings';
+import { QueuePage } from './pages/QueuePage';
+
+type Page = 'home' | 'queue' | 'downloads' | 'settings';
 
 export function App() {
   const [currentPage, setCurrentPage] = useState<Page>('home');
   const { settings, updateSetting, resetSettings } = useSettings();
-  const { activeJobs } = useDownloads();
+  const { activeJobs, queuedJobs } = useDownloads();
+
+  const totalPending = activeJobs.length + queuedJobs.length;
 
   // Listen for completion notifications and show browser notifications
   useEffect(() => {
@@ -43,6 +47,20 @@ export function App() {
           <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
           <polyline points="7 10 12 15 17 10"/>
           <line x1="12" y1="15" x2="12" y2="3"/>
+        </svg>
+      ),
+    },
+    {
+      id: 'queue',
+      label: 'Queue',
+      icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+          <line x1="8" y1="6" x2="21" y2="6"/>
+          <line x1="8" y1="12" x2="21" y2="12"/>
+          <line x1="8" y1="18" x2="21" y2="18"/>
+          <line x1="3" y1="6" x2="3.01" y2="6"/>
+          <line x1="3" y1="12" x2="3.01" y2="12"/>
+          <line x1="3" y1="18" x2="3.01" y2="18"/>
         </svg>
       ),
     },
@@ -114,10 +132,10 @@ export function App() {
                 </span>
                 {item.label}
 
-                {/* Active downloads badge */}
-                {item.id === 'home' && activeJobs.length > 0 && (
-                  <span className="ml-auto text-xs px-1.5 py-0.5 rounded-full bg-brand-500/20 text-brand-300 font-mono">
-                    {activeJobs.length}
+                {/* Queue pending items badge */}
+                {item.id === 'queue' && totalPending > 0 && (
+                  <span className="ml-auto text-xs px-2 py-0.5 rounded-full bg-brand-500 text-white font-mono font-bold text-[11px] animate-pulse">
+                    {totalPending}
                   </span>
                 )}
               </button>
@@ -138,7 +156,17 @@ export function App() {
           </div>
 
           <div className="relative h-full">
-            {currentPage === 'home' && <HomePage settings={settings} />}
+            {currentPage === 'home' && (
+              <HomePage
+                settings={settings}
+                onNavigateQueue={() => setCurrentPage('queue')}
+              />
+            )}
+            {currentPage === 'queue' && (
+              <QueuePage
+                onNavigateHome={() => setCurrentPage('home')}
+              />
+            )}
             {currentPage === 'downloads' && <DownloadsPage />}
             {currentPage === 'settings' && (
               <SettingsPage

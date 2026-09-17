@@ -1,13 +1,14 @@
 import { ipcMain, dialog, shell, app, BrowserWindow } from 'electron';
 import path from 'path';
 import fs from 'fs';
-import { analyzeUrl, getYtDlpVersion, validateVideoUrl } from '../downloader/ytdlp';
+import { analyzeUrl, getYtDlpVersion, validateVideoUrl, getPlaylistInfo } from '../downloader/ytdlp';
 import { getFfmpegVersion } from '../downloader/ffmpeg';
 import { downloadManager } from '../downloader/downloadManager';
 import { getYtDlpPath, getFfmpegPath, getFfprobePath, getTempDir } from '../utils/paths';
 import { getHistory, removeHistoryEntry, clearHistory } from '../utils/history';
 import { isDirectoryWritable } from '../utils/diskSpace';
-import type { DiagnosticsResult, StartDownloadOptions } from '../types';
+import { sanitizeWindowsName, sanitizePath, safeJoinPath } from '../utils/sanitize';
+import type { DiagnosticsResult, StartDownloadOptions, PlaylistInfo, QualityOption } from '../types';
 
 // Settings storage using electron-store
 // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -29,7 +30,7 @@ const store = new Store({
     defaultDownloadDir: app.getPath('downloads'),
     defaultQuality: '1080p',
     defaultFormat: 'mp4',
-    maxConcurrentDownloads: 2,
+    maxConcurrentDownloads: 1,
     theme: 'dark',
     autoCheckYtDlpUpdates: false,
     autoCheckFfmpegUpdates: false,
@@ -37,6 +38,8 @@ const store = new Store({
 });
 
 export function registerIpcHandlers(): void {
+  // Synchronize initial concurrency setting
+  downloadManager.setMaxConcurrent(store.get('maxConcurrentDownloads') || 1);
   // ─── Media Analysis ─────────────────────────────────────────────────────────
 
   ipcMain.handle('media:analyze', async (_event, url: string) => {
@@ -67,8 +70,15 @@ export function registerIpcHandlers(): void {
         return { success: false, error: validation.error || 'Invalid video URL.' };
       }
 
-      // Check and ensure output directory exists (Requirement 15)
-      const targetDir = opts.outputDir || app.getPath('downloads');
+      // Check and ensure output directory exists with strict Windows sanitization
+      let targetDir = opts.outputDir || store.get('defaultDownloadDir') || app.getPath('downloads');
+      targetDir = sanitizePath(targetDir);
+      if (opts.isPlaylist && opts.playlistTitle) {
+        const safeFolder = sanitizeWindowsName(opts.playlistTitle);
+        if (path.basename(targetDir) !== safeFolder) {
+          targetDir = safeJoinPath(targetDir, safeFolder);
+        }
+      }
       if (!fs.existsSync(targetDir)) {
         fs.mkdirSync(targetDir, { recursive: true });
       }
@@ -84,6 +94,85 @@ export function registerIpcHandlers(): void {
   ipcMain.handle('media:cancel-download', async (_event, jobId: string) => {
     downloadManager.cancelDownload(jobId);
     return { success: true };
+  });
+
+  ipcMain.handle('media:pause-download', async (_event, jobId: string) => {
+    const paused = downloadManager.pauseJob(jobId);
+    return { success: paused };
+  });
+
+  ipcMain.handle('media:resume-download', async (_event, jobId: string) => {
+    const resumed = downloadManager.resumeJob(jobId);
+    return { success: resumed };
+  });
+
+  ipcMain.handle('media:retry-download', async (_event, jobId: string) => {
+    const retried = downloadManager.retryJob(jobId);
+    return { success: retried };
+  });
+
+  ipcMain.handle('media:pause-all', async () => {
+    downloadManager.pauseAll();
+    return { success: true };
+  });
+
+  ipcMain.handle('media:resume-all', async () => {
+    downloadManager.resumeAll();
+    return { success: true };
+  });
+
+  ipcMain.handle('media:cancel-all', async () => {
+    downloadManager.cancelAll();
+    return { success: true };
+  });
+
+  ipcMain.handle('media:clear-completed', async () => {
+    downloadManager.clearCompleted();
+    return { success: true };
+  });
+
+  ipcMain.handle('media:clear-failed', async () => {
+    downloadManager.clearFailed();
+    return { success: true };
+  });
+
+  ipcMain.handle('media:set-concurrency', async (_event, n: number) => {
+    const count = Math.max(1, Math.min(3, n));
+    downloadManager.setMaxConcurrent(count);
+    store.set('maxConcurrentDownloads', count);
+    return { success: true, data: count };
+  });
+
+  ipcMain.handle('media:get-concurrency', async () => {
+    return { success: true, data: downloadManager.getMaxConcurrent() };
+  });
+
+  ipcMain.handle('media:get-queue-stats', async () => {
+    return { success: true, data: downloadManager.getQueueStats() };
+  });
+
+  ipcMain.handle('media:get-playlist-info', async (_event, url: string) => {
+    try {
+      const info = await getPlaylistInfo(url);
+      return { success: true, data: info };
+    } catch (err: unknown) {
+      return { success: false, error: String(err) };
+    }
+  });
+
+  ipcMain.handle('media:start-playlist-download', async (_event, opts: { playlist: PlaylistInfo; qualityOption: QualityOption; outputDir: string }) => {
+    try {
+      const baseDir = sanitizePath(opts.outputDir || store.get('defaultDownloadDir') || app.getPath('downloads'));
+      const safePlaylistFolder = sanitizeWindowsName(opts.playlist.title);
+      const playlistDir = path.resolve(safeJoinPath(baseDir, safePlaylistFolder));
+      if (!fs.existsSync(playlistDir)) {
+        fs.mkdirSync(playlistDir, { recursive: true });
+      }
+      const jobIds = downloadManager.startPlaylistDownload(opts.playlist, opts.qualityOption, baseDir);
+      return { success: true, jobIds };
+    } catch (err: unknown) {
+      return { success: false, error: String(err) };
+    }
   });
 
   ipcMain.handle('media:get-jobs', async () => {
@@ -128,32 +217,156 @@ export function registerIpcHandlers(): void {
   });
 
   ipcMain.handle('system:open-file', async (_event, filePath: string) => {
-    if (!filePath || !fs.existsSync(filePath)) {
-      return { success: false, error: 'File not found.' };
+    if (!filePath || typeof filePath !== 'string') {
+      console.warn('[OPEN FILE] No file path specified.');
+      return { success: false, error: 'No file path specified.' };
     }
-    await shell.openPath(filePath);
+
+    let cleanPath = path.resolve(path.normalize(filePath));
+    if (!fs.existsSync(cleanPath)) {
+      const sanitized = sanitizePath(cleanPath);
+      if (fs.existsSync(sanitized)) {
+        cleanPath = sanitized;
+      }
+    }
+    const exists = fs.existsSync(cleanPath);
+    console.log(`[OPEN FILE]\nPATH: ${cleanPath}\nFILE EXISTS: ${exists}`);
+
+    if (!exists) {
+      return {
+        success: false,
+        error: `File does not exist: "${cleanPath}". It may have been moved, renamed, or deleted.`,
+      };
+    }
+
+    const openError = await shell.openPath(cleanPath);
+    if (openError) {
+      console.error(`[OPEN FILE] Failed to open "${cleanPath}":`, openError);
+      return { success: false, error: `Could not open file: ${openError}` };
+    }
     return { success: true };
   });
 
-  ipcMain.handle('system:open-folder', async (_event, filePath: string) => {
-    const dir = fs.existsSync(filePath)
-      ? (fs.statSync(filePath).isDirectory() ? filePath : path.dirname(filePath))
-      : path.dirname(filePath);
-
-    if (!fs.existsSync(dir)) {
-      return { success: false, error: 'Folder not found.' };
+  ipcMain.handle('system:open-folder', async (_event, targetPath: string) => {
+    if (!targetPath || typeof targetPath !== 'string') {
+      console.warn('[OPEN FOLDER] No folder path specified.');
+      return { success: false, error: 'No folder path specified.' };
     }
 
-    await shell.openPath(dir);
+    let cleanPath = path.resolve(path.normalize(targetPath));
+    if (!fs.existsSync(cleanPath)) {
+      const sanitized = sanitizePath(cleanPath);
+      if (fs.existsSync(sanitized)) {
+        cleanPath = sanitized;
+      }
+    }
+
+    let targetDir = cleanPath;
+    if (fs.existsSync(cleanPath)) {
+      targetDir = fs.statSync(cleanPath).isDirectory() ? cleanPath : path.dirname(cleanPath);
+    } else {
+      targetDir = path.dirname(cleanPath);
+    }
+
+    const exists = fs.existsSync(targetDir);
+    console.log(`[OPEN FOLDER]\nPATH: ${targetDir}\nFOLDER EXISTS: ${exists}`);
+
+    if (!exists) {
+      return {
+        success: false,
+        error: `Folder does not exist: "${targetDir}". It may have been moved, renamed, or deleted.`,
+      };
+    }
+
+    const openError = await shell.openPath(targetDir);
+    if (openError) {
+      console.error(`[OPEN FOLDER] Failed to open "${targetDir}":`, openError);
+      return { success: false, error: `Could not open folder: ${openError}` };
+    }
     return { success: true };
   });
 
-  ipcMain.handle('system:show-item-in-folder', async (_event, filePath: string) => {
-    if (!fs.existsSync(filePath)) {
-      return { success: false, error: 'File not found.' };
+  ipcMain.handle('system:show-item-in-folder', async (_event, targetPath: string) => {
+    if (!targetPath || typeof targetPath !== 'string') {
+      console.warn('[SHOW IN FOLDER] No path specified.');
+      return { success: false, error: 'No path specified.' };
     }
-    shell.showItemInFolder(filePath);
-    return { success: true };
+
+    let cleanPath = path.resolve(path.normalize(targetPath));
+    if (!fs.existsSync(cleanPath)) {
+      const sanitized = sanitizePath(cleanPath);
+      if (fs.existsSync(sanitized)) {
+        cleanPath = sanitized;
+      }
+    }
+
+    const exists = fs.existsSync(cleanPath);
+    console.log(`[SHOW IN FOLDER]\nPATH: ${cleanPath}\nITEM EXISTS: ${exists}`);
+
+    if (exists) {
+      shell.showItemInFolder(cleanPath);
+      return { success: true };
+    }
+
+    // If exact item doesn't exist, check parent folder
+    const parentDir = path.dirname(cleanPath);
+    const parentExists = fs.existsSync(parentDir);
+    console.log(`[SHOW IN FOLDER]\nFALLBACK PARENT PATH: ${parentDir}\nPARENT EXISTS: ${parentExists}`);
+    if (parentExists) {
+      await shell.openPath(parentDir);
+      return { success: true };
+    }
+
+    return {
+      success: false,
+      error: `Location does not exist: "${cleanPath}". It may have been moved or deleted.`,
+    };
+  });
+
+  ipcMain.handle('system:delete-file', async (_event, filePath: string) => {
+    if (!filePath || typeof filePath !== 'string') {
+      console.warn('[DELETE FILE] No file path specified.');
+      return { success: false, error: 'No file path specified.' };
+    }
+
+    const cleanPath = path.resolve(path.normalize(filePath));
+    const exists = fs.existsSync(cleanPath);
+    console.log(`[DELETE FILE]\nPATH: ${cleanPath}\nFILE EXISTS: ${exists}`);
+
+    if (!exists) {
+      return { success: false, error: `File does not exist: "${cleanPath}"` };
+    }
+
+    try {
+      await fs.promises.unlink(cleanPath);
+      return { success: true };
+    } catch (err: unknown) {
+      console.error(`[DELETE FILE] Failed to delete "${cleanPath}":`, err);
+      return { success: false, error: String(err) };
+    }
+  });
+
+  ipcMain.handle('system:delete-folder', async (_event, folderPath: string) => {
+    if (!folderPath || typeof folderPath !== 'string') {
+      console.warn('[DELETE FOLDER] No folder path specified.');
+      return { success: false, error: 'No folder path specified.' };
+    }
+
+    const cleanPath = path.resolve(path.normalize(folderPath));
+    const exists = fs.existsSync(cleanPath);
+    console.log(`[DELETE FOLDER]\nPATH: ${cleanPath}\nFOLDER EXISTS: ${exists}`);
+
+    if (!exists) {
+      return { success: false, error: `Folder does not exist: "${cleanPath}"` };
+    }
+
+    try {
+      await fs.promises.rm(cleanPath, { recursive: true, force: true });
+      return { success: true };
+    } catch (err: unknown) {
+      console.error(`[DELETE FOLDER] Failed to delete "${cleanPath}":`, err);
+      return { success: false, error: String(err) };
+    }
   });
 
   ipcMain.handle('system:open-external', async (_event, url: string) => {

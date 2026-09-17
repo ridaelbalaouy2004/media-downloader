@@ -1,20 +1,21 @@
 import React, { useState, useCallback, useEffect } from 'react';
-import type { MediaInfo, QualityOption, DiagnosticsResult, AppSettings } from '../types';
+import type { MediaInfo, QualityOption, DiagnosticsResult, AppSettings, PlaylistInfo } from '../types';
 import { UrlInput } from '../components/UrlInput';
 import { QualitySelector } from '../components/QualitySelector';
 import { DownloadCard } from '../components/DownloadCard';
 import { DiagnosticsPanel } from '../components/DiagnosticsPanel';
 import { DeveloperSection } from '../components/DeveloperSection';
-import { ipc, formatBytes } from '../services/ipc';
+import { ipc } from '../services/ipc';
 import { useDownloads } from '../hooks/useDownload';
 
 interface HomePageProps {
   settings: AppSettings;
+  onNavigateQueue?: () => void;
 }
 
 type AnalysisState = 'idle' | 'loading' | 'success' | 'error';
 
-export function HomePage({ settings }: HomePageProps) {
+export function HomePage({ settings, onNavigateQueue }: HomePageProps) {
   const [analysisState, setAnalysisState] = useState<AnalysisState>('idle');
   const [analysisError, setAnalysisError] = useState<string | null>(null);
   const [mediaInfo, setMediaInfo] = useState<MediaInfo | null>(null);
@@ -23,18 +24,23 @@ export function HomePage({ settings }: HomePageProps) {
   const [isStarting, setIsStarting] = useState(false);
   const [currentJobId, setCurrentJobId] = useState<string | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [detectedPlaylist, setDetectedPlaylist] = useState<PlaylistInfo | null>(null);
+  const [showPlaylistModal, setShowPlaylistModal] = useState(false);
   const [diagnostics, setDiagnostics] = useState<DiagnosticsResult | null>(null);
   const [diagLoading, setDiagLoading] = useState(false);
   const [showDiag, setShowDiag] = useState(false);
 
-  const { jobs, activeJobs, completedJobs, cancelDownload, dismissJob } = useDownloads();
-
-  // Find the active/current download job
-  const currentJob = jobs.find(j => j.jobId === currentJobId);
-  const isJobRunning = currentJob && ['queued', 'analyzing', 'downloading', 'merging', 'finalizing'].includes(currentJob.status);
-
-  // Requirement 11: Disable button while downloading, enable after success or failure
-  const isDownloading = isStarting || Boolean(isJobRunning);
+  const {
+    jobs,
+    activeJobs,
+    queuedJobs,
+    pauseDownload,
+    resumeDownload,
+    retryDownload,
+    cancelDownload,
+    dismissJob,
+  } = useDownloads();
 
   // Update output dir when settings change
   useEffect(() => {
@@ -54,7 +60,6 @@ export function HomePage({ settings }: HomePageProps) {
       const result = await ipc.runDiagnostics();
       if (result.success && result.data) {
         setDiagnostics(result.data);
-        // Show diagnostics panel if something is missing
         if (!result.data.ytDlpFound || !result.data.ffmpegFound) {
           setShowDiag(true);
         }
@@ -64,10 +69,9 @@ export function HomePage({ settings }: HomePageProps) {
     }
   };
 
-  // Requirement 13: Validate YouTube / video URL before starting
   const validateUrl = (urlToValidate: string): { valid: boolean; error?: string } => {
     if (!urlToValidate || !urlToValidate.trim()) {
-      return { valid: false, error: 'Please enter a video URL.' };
+      return { valid: false, error: 'Please enter a media URL.' };
     }
     try {
       const parsed = new URL(urlToValidate.trim());
@@ -76,7 +80,7 @@ export function HomePage({ settings }: HomePageProps) {
       }
       return { valid: true };
     } catch {
-      return { valid: false, error: 'Invalid URL format. Please enter a valid URL (e.g. https://youtu.be/... or https://www.youtube.com/watch?v=...).' };
+      return { valid: false, error: 'Invalid URL format. Please enter a valid URL.' };
     }
   };
 
@@ -91,11 +95,26 @@ export function HomePage({ settings }: HomePageProps) {
     setAnalysisState('loading');
     setAnalysisError(null);
     setDownloadError(null);
+    setSuccessMessage(null);
     setMediaInfo(null);
     setSelectedQuality(null);
+    setDetectedPlaylist(null);
+    setShowPlaylistModal(false);
 
     try {
-      const result = await ipc.analyzeUrl(url);
+      // Check if URL has a playlist parameter or is a playlist URL
+      const isPossiblePlaylist = url.includes('list=') || url.includes('/playlist');
+
+      // Start fetching video info and (if applicable) playlist info in parallel
+      const analyzePromise = ipc.analyzeUrl(url);
+      const playlistPromise = isPossiblePlaylist ? ipc.getPlaylistInfo(url) : Promise.resolve(null);
+
+      const [result, playlistResult] = await Promise.all([analyzePromise, playlistPromise]);
+
+      if (playlistResult && playlistResult.success && playlistResult.data && playlistResult.data.entries.length > 1) {
+        setDetectedPlaylist(playlistResult.data);
+      }
+
       if (result.success && result.data) {
         setMediaInfo(result.data);
         setAnalysisState('success');
@@ -128,15 +147,8 @@ export function HomePage({ settings }: HomePageProps) {
     }
   };
 
-  const handleDownload = async () => {
+  const enqueueSingleDownload = async () => {
     if (!mediaInfo || !selectedQuality || !outputDir) return;
-
-    // Requirement 13: Validate URL
-    const check = validateUrl(mediaInfo.url);
-    if (!check.valid) {
-      setDownloadError(check.error || 'Invalid video URL');
-      return;
-    }
 
     setDownloadError(null);
     setIsStarting(true);
@@ -150,11 +162,40 @@ export function HomePage({ settings }: HomePageProps) {
         thumbnail: mediaInfo.thumbnail,
       });
 
-      // Requirement 10: Show real error inside the UI if failed to start
       if (!result.success) {
-        setDownloadError(result.error || 'Failed to start download.');
+        setDownloadError(result.error || 'Failed to queue download.');
       } else if (result.jobId) {
         setCurrentJobId(result.jobId);
+        setSuccessMessage(`Added "${mediaInfo.title}" to download queue!`);
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setDownloadError(msg);
+    } finally {
+      setIsStarting(false);
+      setShowPlaylistModal(false);
+    }
+  };
+
+  const enqueuePlaylistDownload = async () => {
+    if (!mediaInfo || !selectedQuality || !outputDir || !detectedPlaylist) return;
+
+    setDownloadError(null);
+    setIsStarting(true);
+
+    try {
+      const result = await ipc.startPlaylistDownload({
+        playlist: detectedPlaylist,
+        qualityOption: selectedQuality,
+        outputDir,
+      });
+
+      if (!result.success) {
+        setDownloadError(result.error || 'Failed to queue playlist.');
+      } else {
+        const count = result.jobIds?.length ?? detectedPlaylist.entries.length;
+        setSuccessMessage(`Added ${count} playlist items to download queue!`);
+        setShowPlaylistModal(false);
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -164,23 +205,24 @@ export function HomePage({ settings }: HomePageProps) {
     }
   };
 
-  // Requirement 11: Disable button while downloading
-  const canDownload = mediaInfo && selectedQuality && outputDir &&
-    (diagnostics?.ytDlpFound ?? true) && !isDownloading;
-
-  // Compute button label based on exact stages (Requirement 12)
-  const getButtonText = () => {
-    if (isStarting) return 'Preparing download...';
-    if (currentJob?.status === 'downloading') {
-      const pct = currentJob.progress.percent !== null ? ` ${currentJob.progress.percent.toFixed(0)}%` : '';
-      return `Downloading${pct}...`;
+  const handleDownloadClick = () => {
+    if (detectedPlaylist && detectedPlaylist.entries.length > 1) {
+      setShowPlaylistModal(true);
+    } else {
+      enqueueSingleDownload();
     }
-    if (currentJob?.status === 'merging') return 'Merging video and audio...';
-    if (currentJob?.status === 'queued') return 'Preparing download...';
-    return 'Download';
   };
 
-  // Recent jobs to display (active first, followed by recent completed/failed)
+  // Non-blocking: Can download whenever valid info & quality exist
+  const canDownload = Boolean(
+    mediaInfo &&
+    selectedQuality &&
+    outputDir &&
+    (diagnostics?.ytDlpFound ?? true) &&
+    !isStarting
+  );
+
+  // Recent jobs to display
   const displayJobs = jobs.slice(0, 5);
 
   return (
@@ -191,14 +233,13 @@ export function HomePage({ settings }: HomePageProps) {
         <div className="text-center space-y-2 py-4">
           <div className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-brand-500/10 border border-brand-500/20 text-brand-400 text-xs font-medium mb-3">
             <div className="w-1.5 h-1.5 rounded-full bg-brand-400 animate-pulse" />
-            Powered by yt-dlp + FFmpeg
+            Permanent Global Multi-Download Queue
           </div>
           <h1 className="text-4xl font-black text-white tracking-tight">
             Media Downloader
           </h1>
           <p className="text-white/40 text-sm max-w-md mx-auto">
-            Download videos and audio from YouTube and thousands of supported sites.
-            All processing happens locally on your PC.
+            Download videos, playlists, and audio from YouTube, TikTok, Facebook, Instagram and more with non-blocking multi-queueing.
           </p>
           <div className="pt-2 flex justify-center">
             <DeveloperSection variant="hero" />
@@ -210,6 +251,24 @@ export function HomePage({ settings }: HomePageProps) {
           onAnalyze={handleAnalyze}
           isLoading={analysisState === 'loading'}
         />
+
+        {/* Success toast / notification with Quick Link to Queue */}
+        {successMessage && (
+          <div className="flex items-center justify-between p-4 rounded-2xl bg-brand-500/15 border border-brand-500/30 animate-slide-down">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <div className="w-2.5 h-2.5 rounded-full bg-brand-400 flex-shrink-0 animate-pulse" />
+              <p className="text-sm font-semibold text-brand-200 truncate">{successMessage}</p>
+            </div>
+            {onNavigateQueue && (
+              <button
+                onClick={onNavigateQueue}
+                className="text-xs px-3.5 py-1.5 rounded-xl bg-brand-500 hover:bg-brand-400 text-white font-bold transition-all shadow-md shadow-brand-500/20 flex-shrink-0 ml-3"
+              >
+                View Queue ({activeJobs.length + queuedJobs.length}) →
+              </button>
+            )}
+          </div>
+        )}
 
         {/* Analysis Error state */}
         {analysisState === 'error' && analysisError && (
@@ -228,7 +287,7 @@ export function HomePage({ settings }: HomePageProps) {
           </div>
         )}
 
-        {/* Requirement 10: Real yt-dlp download failure alert */}
+        {/* Real yt-dlp download failure alert */}
         {downloadError && (
           <div className="flex items-start gap-3 p-4 rounded-2xl bg-red-500/10 border border-red-500/30 animate-slide-down">
             <div className="w-8 h-8 rounded-full bg-red-500/20 flex items-center justify-center flex-shrink-0 mt-0.5">
@@ -273,12 +332,19 @@ export function HomePage({ settings }: HomePageProps) {
 
                 {/* Meta */}
                 <div className="flex-1 min-w-0">
-                  {mediaInfo.platform && (
-                    <span className="inline-flex items-center gap-1 uppercase tracking-wider text-[10px] font-bold px-2 py-0.5 rounded-md bg-white/10 text-white/70 mb-1.5 border border-white/10">
-                      <span className="w-1.5 h-1.5 rounded-full bg-brand-400" />
-                      {mediaInfo.platform}
-                    </span>
-                  )}
+                  <div className="flex items-center gap-2 mb-1.5 flex-wrap">
+                    {mediaInfo.platform && (
+                      <span className="inline-flex items-center gap-1 uppercase tracking-wider text-[10px] font-bold px-2 py-0.5 rounded-md bg-white/10 text-white/70 border border-white/10">
+                        <span className="w-1.5 h-1.5 rounded-full bg-brand-400" />
+                        {mediaInfo.platform}
+                      </span>
+                    )}
+                    {detectedPlaylist && (
+                      <span className="inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-md bg-brand-500/20 text-brand-300 border border-brand-500/30">
+                        📋 Playlist ({detectedPlaylist.entryCount} items)
+                      </span>
+                    )}
+                  </div>
                   <h2 className="text-base font-bold text-white/95 leading-tight line-clamp-2">
                     {mediaInfo.title}
                   </h2>
@@ -302,7 +368,7 @@ export function HomePage({ settings }: HomePageProps) {
                     {mediaInfo.viewCount !== null && (
                       <div className="flex items-center gap-1.5 text-xs text-white/50">
                         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                          <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                          <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8z"/>
                           <circle cx="12" cy="12" r="3"/>
                         </svg>
                         {mediaInfo.viewCount.toLocaleString()}
@@ -351,9 +417,9 @@ export function HomePage({ settings }: HomePageProps) {
                   </div>
                 </div>
 
-                {/* Requirement 11: Download button disabled while downloading */}
+                {/* Non-blocking Download button */}
                 <button
-                  onClick={handleDownload}
+                  onClick={handleDownloadClick}
                   disabled={!canDownload}
                   id="download-btn"
                   className={`
@@ -364,7 +430,7 @@ export function HomePage({ settings }: HomePageProps) {
                     }
                   `}
                 >
-                  {isDownloading ? (
+                  {isStarting ? (
                     <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
                   ) : (
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
@@ -373,7 +439,11 @@ export function HomePage({ settings }: HomePageProps) {
                       <line x1="12" y1="15" x2="12" y2="3"/>
                     </svg>
                   )}
-                  {getButtonText()}
+                  {isStarting
+                    ? 'Adding to Queue...'
+                    : detectedPlaylist
+                      ? `Download (${detectedPlaylist.entryCount} Playlist Videos Available)`
+                      : 'Add to Download Queue'}
                 </button>
 
                 {!diagnostics?.ytDlpFound && (
@@ -387,17 +457,87 @@ export function HomePage({ settings }: HomePageProps) {
           </div>
         )}
 
-        {/* Requirements 9, 10, 12: Download progress & recent downloads */}
+        {/* Playlist Selection Modal Dialog */}
+        {showPlaylistModal && detectedPlaylist && (
+          <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
+            <div className="bg-surface-800 border border-white/15 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl animate-scale-in">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-brand-500/20 flex items-center justify-center text-brand-400">
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <line x1="8" y1="6" x2="21" y2="6"/>
+                    <line x1="8" y1="12" x2="21" y2="12"/>
+                    <line x1="8" y1="18" x2="21" y2="18"/>
+                    <line x1="3" y1="6" x2="3.01" y2="6"/>
+                    <line x1="3" y1="12" x2="3.01" y2="12"/>
+                    <line x1="3" y1="18" x2="3.01" y2="18"/>
+                  </svg>
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-white">Playlist Detected</h3>
+                  <p className="text-xs text-white/50">{detectedPlaylist.entryCount} videos found</p>
+                </div>
+              </div>
+
+              <div className="p-3 rounded-xl bg-surface-700/50 border border-white/5">
+                <p className="text-sm font-semibold text-white/90 truncate">{detectedPlaylist.title}</p>
+                <p className="text-xs text-white/40 mt-1">
+                  How would you like to download this URL?
+                </p>
+              </div>
+
+              <div className="space-y-2 pt-2">
+                <button
+                  onClick={enqueuePlaylistDownload}
+                  disabled={isStarting}
+                  className="w-full py-3 px-4 rounded-xl text-sm font-bold bg-brand-500 hover:bg-brand-400 text-white shadow-lg shadow-brand-500/20 transition-all flex items-center justify-center gap-2"
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <line x1="8" y1="6" x2="21" y2="6"/>
+                    <line x1="8" y1="12" x2="21" y2="12"/>
+                    <line x1="8" y1="18" x2="21" y2="18"/>
+                  </svg>
+                  <span>Download Entire Playlist ({detectedPlaylist.entryCount} items)</span>
+                </button>
+
+                <button
+                  onClick={enqueueSingleDownload}
+                  disabled={isStarting}
+                  className="w-full py-2.5 px-4 rounded-xl text-xs font-semibold bg-white/10 hover:bg-white/15 text-white/80 transition-all"
+                >
+                  Download Single Video Only
+                </button>
+
+                <button
+                  onClick={() => setShowPlaylistModal(false)}
+                  className="w-full py-2 px-4 rounded-xl text-xs text-white/40 hover:text-white/70 transition-all"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Download Queue preview & recent downloads */}
         {displayJobs.length > 0 && (
           <div className="space-y-3">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <div className={`w-2 h-2 rounded-full ${isJobRunning ? 'bg-brand-400 animate-pulse' : 'bg-white/40'}`} />
+                <div className={`w-2 h-2 rounded-full ${activeJobs.length > 0 ? 'bg-brand-400 animate-pulse' : 'bg-white/40'}`} />
                 <h2 className="text-sm font-bold text-white/70">
-                  {isJobRunning ? 'Current Download' : 'Recent Downloads'}
+                  {activeJobs.length > 0 ? 'Live Downloads & Queue' : 'Recent Downloads'}
                 </h2>
-                <span className="text-xs text-white/30 bg-white/8 rounded-full px-2 py-0.5">{displayJobs.length}</span>
+                <span className="text-xs text-white/30 bg-white/8 rounded-full px-2 py-0.5">{jobs.length}</span>
               </div>
+              {onNavigateQueue && (
+                <button
+                  onClick={onNavigateQueue}
+                  className="text-xs font-semibold text-brand-400 hover:text-brand-300 transition-colors flex items-center gap-1"
+                >
+                  <span>View All in Queue ({jobs.length})</span>
+                  <span>→</span>
+                </button>
+              )}
             </div>
             <div className="space-y-3">
               {displayJobs.map(job => (
@@ -405,6 +545,9 @@ export function HomePage({ settings }: HomePageProps) {
                   key={job.jobId}
                   job={job}
                   onCancel={cancelDownload}
+                  onPause={pauseDownload}
+                  onResume={resumeDownload}
+                  onRetry={retryDownload}
                   onDismiss={dismissJob}
                 />
               ))}

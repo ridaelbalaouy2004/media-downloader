@@ -36,12 +36,22 @@ export function DownloadsPage() {
     setHistory([]);
   };
 
+  const [actionError, setActionError] = useState<string | null>(null);
+
   const handleOpenFile = async (filePath: string) => {
-    await ipc.openFile(filePath);
+    setActionError(null);
+    const res = await ipc.openFile(filePath);
+    if (!res.success && res.error) {
+      setActionError(res.error);
+    }
   };
 
   const handleOpenFolder = async (filePath: string) => {
-    await ipc.showItemInFolder(filePath);
+    setActionError(null);
+    const res = await ipc.showItemInFolder(filePath);
+    if (!res.success && res.error) {
+      setActionError(res.error);
+    }
   };
 
   if (loading) {
@@ -72,6 +82,19 @@ export function DownloadsPage() {
           </button>
         )}
       </div>
+
+      {/* Action error alert */}
+      {actionError && (
+        <div className="mb-4 p-3 rounded-xl bg-red-500/15 border border-red-500/30 text-xs text-red-200 flex items-center justify-between animate-slide-down">
+          <div className="flex items-center gap-2 min-w-0">
+            <span className="text-red-400 font-bold">⚠</span>
+            <span className="truncate">{actionError}</span>
+          </div>
+          <button onClick={() => setActionError(null)} className="text-red-400 hover:text-red-200 font-bold ml-2 px-1">
+            ✕
+          </button>
+        </div>
+      )}
 
       {/* History list */}
       {history.length === 0 ? (
@@ -126,7 +149,13 @@ function HistoryItem({ entry, removing, onRemove, onOpenFile, onOpenFolder }: Hi
       `}
     >
       {/* Thumbnail */}
-      <div className="flex-shrink-0 w-16 h-10 rounded-lg overflow-hidden bg-surface-600/50">
+      <div
+        onClick={entry.outputFile ? () => onOpenFile(entry.outputFile) : undefined}
+        className={`flex-shrink-0 w-16 h-10 rounded-lg overflow-hidden bg-surface-600/50 ${
+          entry.outputFile ? 'cursor-pointer hover:opacity-80 transition-opacity' : ''
+        }`}
+        title={entry.outputFile ? 'Click to open file' : undefined}
+      >
         {entry.thumbnail ? (
           <img
             src={entry.thumbnail}
@@ -146,7 +175,15 @@ function HistoryItem({ entry, removing, onRemove, onOpenFile, onOpenFolder }: Hi
 
       {/* Info */}
       <div className="flex-1 min-w-0">
-        <p className="text-sm font-semibold text-white/80 truncate" title={entry.title}>
+        <p
+          onClick={entry.outputFile ? () => onOpenFile(entry.outputFile) : undefined}
+          className={`text-sm font-semibold truncate ${
+            entry.outputFile
+              ? 'text-white/80 hover:text-brand-300 cursor-pointer underline-offset-2 hover:underline'
+              : 'text-white/80'
+          }`}
+          title={entry.outputFile ? `Open: ${entry.outputFile}` : entry.title}
+        >
           {entry.title}
         </p>
         <div className="flex items-center gap-2 mt-0.5 flex-wrap">

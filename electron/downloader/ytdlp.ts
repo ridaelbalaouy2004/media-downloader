@@ -4,9 +4,26 @@ import fs from 'fs';
 import https from 'https';
 import http from 'http';
 import { getYtDlpPath, getFfmpegPath } from '../utils/paths';
+import { sanitizeWindowsName, sanitizePath } from '../utils/sanitize';
 import { parseFormat, buildQualityOptions, buildYtDlpFormatSelector } from './formats';
 import { processManager } from './processManager';
-import type { MediaInfo, DownloadProgress, QualityOption, PlatformType } from '../types';
+import type { MediaInfo, DownloadProgress, QualityOption, PlatformType, PlaylistInfo, PlaylistEntry } from '../types';
+
+/**
+ * Check if URL points to a playlist.
+ */
+export function isPlaylistUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url.trim());
+    return (
+      parsed.searchParams.has('list') ||
+      parsed.pathname.includes('/playlist') ||
+      parsed.pathname.includes('/sets/')
+    );
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Parse duration in seconds to HH:MM:SS string.
@@ -140,7 +157,13 @@ export function validateVideoUrl(url: string): { valid: boolean; platform: Platf
     if (hostname === 'youtu.be' && parsed.pathname.length <= 1) {
       return { valid: false, platform, error: 'Invalid YouTube short URL: missing video ID.' };
     }
-    if (parsed.pathname === '/watch' && !parsed.searchParams.get('v')) {
+    if (parsed.pathname === '/playlist') {
+      if (!parsed.searchParams.get('list')) {
+        return { valid: false, platform, error: 'Invalid YouTube playlist URL: missing "?list=" parameter.' };
+      }
+      return { valid: true, platform };
+    }
+    if (parsed.pathname === '/watch' && !parsed.searchParams.get('v') && !parsed.searchParams.get('list')) {
       return { valid: false, platform, error: 'Invalid YouTube URL: missing "?v=" video ID parameter.' };
     }
   }
@@ -300,6 +323,74 @@ export async function analyzeUrl(url: string): Promise<MediaInfo> {
   });
 }
 
+/**
+ * Retrieve metadata and entries for a playlist using yt-dlp --flat-playlist.
+ */
+export async function getPlaylistInfo(url: string): Promise<PlaylistInfo> {
+  const ytDlpPath = getYtDlpPath();
+  if (!fs.existsSync(ytDlpPath)) {
+    throw new Error(`yt-dlp engine not found at: ${ytDlpPath}`);
+  }
+
+  return new Promise((resolve, reject) => {
+    const args = [
+      '--flat-playlist',
+      '--dump-single-json',
+      '--no-warnings',
+      '--extractor-args', 'youtube:player_client=default,web,android',
+      url.trim(),
+    ];
+
+    let stdout = '';
+    let stderr = '';
+
+    const proc = spawn(ytDlpPath, args, {
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    proc.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
+    proc.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+
+    proc.on('close', (code) => {
+      if (code !== 0 || !stdout.trim()) {
+        const friendly = parseYtDlpError(stderr, url);
+        reject(new Error(friendly));
+        return;
+      }
+
+      try {
+        const json = JSON.parse(stdout.trim());
+        const rawEntries = Array.isArray(json.entries) ? json.entries : [];
+        const entries: PlaylistEntry[] = rawEntries.map((e: any, idx: number) => ({
+          id: String(e.id || idx),
+          url: e.url && typeof e.url === 'string' && e.url.startsWith('http')
+            ? e.url
+            : (e.id ? `https://www.youtube.com/watch?v=${e.id}` : url),
+          title: e.title || `Video ${idx + 1}`,
+          duration: typeof e.duration === 'number' ? e.duration : undefined,
+          thumbnail: e.thumbnail || (Array.isArray(e.thumbnails) && e.thumbnails.length > 0 ? e.thumbnails[e.thumbnails.length - 1]?.url : ''),
+        }));
+
+        resolve({
+          id: String(json.id || 'playlist'),
+          title: json.title || 'YouTube Playlist',
+          uploader: json.uploader || json.channel || '',
+          entryCount: entries.length,
+          entries,
+          url: url.trim(),
+        });
+      } catch (err) {
+        reject(new Error(`Failed to parse playlist details: ${String(err)}`));
+      }
+    });
+
+    proc.on('error', (err) => {
+      reject(new Error(`Failed to launch download engine: ${err.message}`));
+    });
+  });
+}
+
 export interface DownloadMediaOptions {
   jobId: string;
   url: string;
@@ -309,6 +400,9 @@ export interface DownloadMediaOptions {
   onProgress: (progress: Partial<DownloadProgress>) => void;
   onComplete: (outputFile: string) => void;
   onError: (error: string, details?: string) => void;
+  isPlaylist?: boolean;
+  playlistTitle?: string;
+  playlistIndex?: number;
 }
 
 /**
@@ -362,7 +456,18 @@ async function downloadDirectImage(
 export async function downloadMedia(opts: DownloadMediaOptions): Promise<void> {
   const ytDlpPath = getYtDlpPath();
   const ffmpegPath = getFfmpegPath();
-  const { jobId, url, qualityOption, outputDir, tempDir, onProgress, onComplete, onError } = opts;
+  const {
+    jobId,
+    url,
+    qualityOption,
+    outputDir,
+    tempDir,
+    onProgress,
+    onComplete,
+    onError,
+    isPlaylist,
+    playlistTitle,
+  } = opts;
 
   // --- Validate URL ---
   const urlValidation = validateVideoUrl(url);
@@ -372,8 +477,9 @@ export async function downloadMedia(opts: DownloadMediaOptions): Promise<void> {
   }
 
   // --- Ensure directories exist ---
+  const cleanOutputDir = sanitizePath(outputDir);
   if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
-  if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+  if (!fs.existsSync(cleanOutputDir)) fs.mkdirSync(cleanOutputDir, { recursive: true });
 
   // --- Special Case: Direct Image Download ---
   if (isDirectImageUrl(url) || qualityOption?.mediaType === 'image') {
@@ -403,22 +509,36 @@ export async function downloadMedia(opts: DownloadMediaOptions): Promise<void> {
     return;
   }
 
-  // Output template
-  const outputTemplate = path.join(tempDir, '%(title)s.%(ext)s');
+  // Build consistent output template
+  let filenamePattern: string;
+  if (typeof opts.playlistIndex === 'number' && opts.playlistIndex > 0) {
+    const indexStr = String(opts.playlistIndex).padStart(2, '0');
+    filenamePattern = `${indexStr} - %(title)s.%(ext)s`;
+  } else {
+    filenamePattern = '%(title)s.%(ext)s';
+  }
+  const outputTemplate = path.join(tempDir, filenamePattern);
 
   // Build format selector
   const formatSelector = qualityOption
     ? buildYtDlpFormatSelector(qualityOption)
     : 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bestvideo+bestaudio/best';
 
+  // If URL has a specific video ID, ALWAYS force --no-playlist
+  // This prevents yt-dlp from downloading the entire playlist for a single item!
+  const hasSpecificVideo = url.includes('v=') || url.includes('/v/') || url.includes('youtu.be/');
+  const isPurePlaylist = isPlaylist && !hasSpecificVideo && (url.includes('/playlist') || url.includes('/sets/'));
+
   // Build arguments safely
   const args: string[] = [
-    '--no-playlist',
+    isPurePlaylist ? '--yes-playlist' : '--no-playlist',
+    '--continue',
     '--newline',
     '--force-ipv4',
     '--ffmpeg-location', ffmpegPath,
     '--progress',
     '--windows-filenames',
+    '--print', 'after_move:filepath',
     '--extractor-args', 'youtube:player_client=default,web,android',
     '-o', outputTemplate,
   ];
@@ -447,6 +567,7 @@ export async function downloadMedia(opts: DownloadMediaOptions): Promise<void> {
 
   console.log('[ytdlp] Starting execution for job:', jobId);
   console.log('[ytdlp] Format selector:', formatSelector);
+  console.log('[ytdlp] Output template:', outputTemplate);
 
   onProgress({ status: 'downloading', stage: 'Preparing download...', percent: 0 });
 
@@ -460,12 +581,52 @@ export async function downloadMedia(opts: DownloadMediaOptions): Promise<void> {
     processManager.register(jobId, proc);
 
     let stderrBuffer = '';
+    let capturedPrintPath: string | null = null;
+    let capturedMergerPath: string | null = null;
+    let capturedDestPath: string | null = null;
 
     proc.stdout.on('data', (chunk: Buffer) => {
       const text = chunk.toString();
       const lines = text.split('\n');
-      for (const line of lines) {
-        parseYtDlpProgress(line.trim(), onProgress);
+      for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line) continue;
+
+        // 1. Capture path printed by --print after_move:filepath
+        if ((line.includes(tempDir) || path.isAbsolute(line)) && !line.startsWith('[')) {
+          if (/\.(mp4|mp3|m4a|webm|mkv|jpg|jpeg|png|webp|gif)$/i.test(line)) {
+            capturedPrintPath = path.normalize(line);
+          }
+        }
+
+        // 2. Capture path from [Merger] Merging formats into "..."
+        const mergerMatch = line.match(/\[Merger\]\s+Merging formats into ["'](.*?)["']/i);
+        if (mergerMatch && mergerMatch[1]) {
+          capturedMergerPath = path.normalize(mergerMatch[1].trim());
+        }
+
+        // 3. Capture path from [ExtractAudio] Destination: ...
+        const audioMatch = line.match(/\[ExtractAudio\]\s+Destination:\s+(.*)/i);
+        if (audioMatch && audioMatch[1]) {
+          capturedDestPath = path.normalize(audioMatch[1].trim());
+        }
+
+        // 4. Capture path from [download] Destination: ...
+        const destMatch = line.match(/\[download\]\s+Destination:\s+(.*)/i);
+        if (destMatch && destMatch[1]) {
+          const destCandidate = path.normalize(destMatch[1].trim());
+          if (!destCandidate.endsWith('.part') && !destCandidate.endsWith('.temp') && !destCandidate.endsWith('.ytdl')) {
+            capturedDestPath = destCandidate;
+          }
+        }
+
+        // 5. Capture path from [download] ... has already been downloaded
+        const alreadyMatch = line.match(/\[download\]\s+(.*?)\s+has already been downloaded/i);
+        if (alreadyMatch && alreadyMatch[1]) {
+          capturedDestPath = path.normalize(alreadyMatch[1].trim());
+        }
+
+        parseYtDlpProgress(line, onProgress);
       }
     });
 
@@ -498,12 +659,37 @@ export async function downloadMedia(opts: DownloadMediaOptions): Promise<void> {
         return;
       }
 
-      // Find output file in temp dir
-      const outputFile = findOutputFile(tempDir);
+      // Determine real output file from captured paths, falling back to directory scan
+      let outputFile: string | null = null;
+      const candidates = [capturedPrintPath, capturedMergerPath, capturedDestPath];
+      for (const candidate of candidates) {
+        if (candidate && fs.existsSync(candidate)) {
+          const stat = fs.statSync(candidate);
+          if (stat.isFile() && stat.size > 0 && !candidate.endsWith('.part') && !candidate.endsWith('.ytdl')) {
+            outputFile = candidate;
+            break;
+          }
+        }
+      }
+
       if (!outputFile) {
+        outputFile = findOutputFile(tempDir);
+      }
+
+      if (!outputFile || !fs.existsSync(outputFile)) {
         const errMsg = 'Download finished but output file was not found in temporary directory.';
         onProgress({ status: 'failed', stage: 'Download failed', percent: null });
         onError(errMsg, `Temp dir: ${tempDir}\nStderr: ${stderrBuffer}`);
+        resolve();
+        return;
+      }
+
+      // Ensure file has non-zero size
+      const finalStat = fs.statSync(outputFile);
+      if (finalStat.size === 0) {
+        const errMsg = 'Download completed but the output file is 0 bytes.';
+        onProgress({ status: 'failed', stage: 'Download failed', percent: null });
+        onError(errMsg, `File: ${outputFile}`);
         resolve();
         return;
       }
